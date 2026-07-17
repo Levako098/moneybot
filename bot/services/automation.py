@@ -35,7 +35,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notifications": {
         "enabled": True,
         "incoming_messages": True,
-        "outgoing_messages": True,
+        "outgoing_messages": False,
         "orders": True,
         "reviews": True,
         "refunds": True,
