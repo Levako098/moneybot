@@ -5,11 +5,15 @@ import csv
 import html
 import io
 import logging
+import platform
 import re
 import sys
-from types import SimpleNamespace
+import time
+import zipfile
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import psutil
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -47,12 +51,20 @@ from bot.services.tickets import (
     TicketError,
 )
 from bot.services.plugin_manager import PluginManager, PluginRecord
+from bot.services.system_settings import CleanupResult, SystemSettingsService
 
+
+LOG_PATH = Path(__file__).resolve().parent / "data" / "moneybot.log"
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("moneybot")
 router = Router(name="owner")
@@ -76,6 +88,10 @@ class AutomationSettings(StatesGroup):
 
 class AutoDeliverySettings(StatesGroup):
     waiting_text = State()
+
+
+class SystemSettings(StatesGroup):
+    waiting_log_limit = State()
 
 
 class OwnerOnlyMiddleware(BaseMiddleware):
@@ -205,8 +221,9 @@ def settings_menu() -> InlineKeyboardMarkup:
     builder.button(text="Ответ на сообщения", callback_data="settings:messages")
     builder.button(text="Ответ на отзывы", callback_data="settings:reviews")
     builder.button(text="Уведомления", callback_data="settings:notifications")
+    builder.button(text="Системные настройки", callback_data="settings:system")
     builder.button(text="Назад", callback_data="menu:main")
-    builder.adjust(1)
+    builder.adjust(2, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -268,6 +285,32 @@ def notifications_settings_menu(settings: dict[str, Any]) -> InlineKeyboardMarku
         )
     builder.button(text="Назад", callback_data="menu:settings")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def system_settings_menu(settings: dict[str, Any]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    marker = "🟢" if settings["logs_enabled"] else "🔴"
+    builder.button(
+        text=f"{marker} Логи",
+        callback_data="settings:system:toggle_logs",
+    )
+    builder.button(text="Ресурсы", callback_data="settings:system:resources")
+    builder.button(
+        text=f"Лимит: {settings['max_log_size_mb']} МБ",
+        callback_data="settings:system:log_limit",
+    )
+    builder.button(text="Очистить логи", callback_data="settings:system:cleanup")
+    builder.button(text="Назад", callback_data="menu:settings")
+    builder.adjust(2, 1, 1, 1)
+    return builder.as_markup()
+
+
+def system_resources_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Обновить", callback_data="settings:system:resources")
+    builder.button(text="Назад", callback_data="settings:system")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -516,11 +559,11 @@ def format_funpay_message(message: Any, account_id: int | None) -> str:
     return f"{title}\n{body_text}"
 
 
-def funpay_chat_menu(chat_id: Any, test: bool = False) -> InlineKeyboardMarkup:
+def funpay_chat_menu(chat_id: Any) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
         text="Ответить",
-        callback_data="fp:test_reply" if test else f"fp:reply:{chat_id}",
+        callback_data=f"fp:reply:{chat_id}",
     )
     builder.button(
         text="Открыть чат",
@@ -535,12 +578,11 @@ async def send_funpay_notification(
     owner_id: int,
     message: Any,
     account_id: int | None,
-    test: bool = False,
 ) -> None:
     await bot.send_message(
         owner_id,
         format_funpay_message(message, account_id),
-        reply_markup=funpay_chat_menu(getattr(message, "chat_id", ""), test=test),
+        reply_markup=funpay_chat_menu(getattr(message, "chat_id", "")),
     )
 
 
@@ -677,6 +719,110 @@ def format_notification_settings(automation: AutomationService) -> str:
     return "\n".join(lines)
 
 
+def format_system_settings(system_settings: SystemSettingsService) -> str:
+    settings = system_settings.get_settings()
+    logs_status = "включены" if settings["logs_enabled"] else "выключены"
+    return (
+        "<b>Системные настройки</b>\n\n"
+        f"<b>Логи:</b> {logs_status}\n"
+        f"<b>Автоочистка:</b> при размере файла больше "
+        f"{settings['max_log_size_mb']} МБ\n"
+        "<b>Проверка:</b> один раз в час\n\n"
+        "Здесь можно посмотреть ресурсы сервера, отключить запись логов или очистить их."
+    )
+
+
+def format_cleanup_result(result: CleanupResult) -> str:
+    text = (
+        f"Очищено файлов: {result.files_cleaned}\n"
+        f"Освобождено: {format_bytes(result.bytes_freed)}"
+    )
+    if result.files_failed:
+        text += f"\nНе удалось очистить: {result.files_failed}"
+    return text
+
+
+def format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if size < 1024 or unit == "ТБ":
+            decimals = 0 if unit == "Б" else 1
+            return f"{size:.{decimals}f} {unit}"
+        size /= 1024
+    return f"{size:.1f} ТБ"
+
+
+def format_duration(seconds: int) -> str:
+    days, remainder = divmod(max(seconds, 0), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} д")
+    if hours or days:
+        parts.append(f"{hours} ч")
+    parts.append(f"{minutes} мин")
+    return " ".join(parts)
+
+
+def collect_system_info() -> str:
+    process = psutil.Process()
+    process.cpu_percent(None)
+    cpu_percent = psutil.cpu_percent(interval=0.25)
+    process_cpu = process.cpu_percent(None)
+    memory = psutil.virtual_memory()
+    disk_path = Path.cwd().anchor or "/"
+    disk = psutil.disk_usage(disk_path)
+    system_uptime = int(time.time() - psutil.boot_time())
+    process_uptime = int(time.time() - process.create_time())
+    process_memory = process.memory_info().rss
+    physical_cores = psutil.cpu_count(logical=False) or 0
+    logical_cores = psutil.cpu_count(logical=True) or 0
+    return (
+        "<b>Система</b>\n\n"
+        f"<b>ОС:</b> {html.escape(platform.system())} {html.escape(platform.release())}\n"
+        f"<b>Python:</b> {html.escape(platform.python_version())}\n"
+        f"<b>Аптайм системы:</b> {format_duration(system_uptime)}\n\n"
+        "<b>Процессор</b>\n"
+        f"Загрузка: {cpu_percent:.1f}%\n"
+        f"Ядра: {physical_cores} физических / {logical_cores} логических\n\n"
+        "<b>Оперативная память</b>\n"
+        f"Использовано: {format_bytes(memory.used)} из {format_bytes(memory.total)} "
+        f"({memory.percent:.1f}%)\n"
+        f"Доступно: {format_bytes(memory.available)}\n\n"
+        f"<b>Диск {html.escape(disk_path)}</b>\n"
+        f"Использовано: {format_bytes(disk.used)} из {format_bytes(disk.total)} "
+        f"({disk.percent:.1f}%)\n"
+        f"Свободно: {format_bytes(disk.free)}\n\n"
+        "<b>Процесс бота</b>\n"
+        f"Память: {format_bytes(process_memory)}\n"
+        f"CPU: {process_cpu:.1f}%\n"
+        f"Работает: {format_duration(process_uptime)}"
+    )
+
+
+def build_log_archive(files: list[Path]) -> tuple[bytes, int, int]:
+    output = io.BytesIO()
+    count = 0
+    source_size = 0
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if not data:
+                continue
+            try:
+                archive_name = str(path.relative_to(Path.cwd())).replace("\\", "/")
+            except ValueError:
+                archive_name = path.name
+            archive.writestr(archive_name, data)
+            count += 1
+            source_size += len(data)
+    return output.getvalue(), count, source_size
+
+
 def support_error(error: Exception) -> str:
     if isinstance(error, SupportRateLimitedError):
         return str(error)
@@ -707,30 +853,45 @@ async def command_tickets(message: Message, state: FSMContext) -> None:
     await message.answer("<b>Тикеты FunPay Support</b>", reply_markup=tickets_menu())
 
 
-@router.message(Command("testmessage"))
-async def command_test_message(
-    message: Message, bot: Bot, plugin_manager: PluginManager
+@router.message(Command("system"))
+async def command_system(message: Message) -> None:
+    wait = await message.answer("Собираю информацию о системе...")
+    try:
+        text = await asyncio.to_thread(collect_system_info)
+    except Exception as error:
+        text = (
+            "<b>Не удалось получить информацию о системе</b>\n"
+            + html.escape(str(error).splitlines()[0][:300])
+        )
+    await wait.edit_text(text)
+
+
+@router.message(Command("log"))
+async def command_log(
+    message: Message, system_settings: SystemSettingsService
 ) -> None:
-    account_id = plugin_manager.account.id if plugin_manager.account else None
-    sample = SimpleNamespace(
-        author_id=123456789,
-        author="Vladislava",
-        chat_id=123456789,
-        chat_name="Vladislava",
-        text=(
-            "Здравствуйте.\n"
-            "Покупатель запрашивает возврат средств. Продавец, если вы не готовы "
-            "выполнять заказ, то, пожалуйста, верните деньги покупателю."
+    wait = await message.answer("Собираю логи...")
+    files = system_settings.get_log_files()
+    archive, count, source_size = await asyncio.to_thread(build_log_archive, files)
+    if count == 0:
+        await wait.edit_text("Лог-файлы пока пусты или не найдены.")
+        return
+    if len(archive) > 49 * 1024 * 1024:
+        await wait.edit_text(
+            "Архив логов больше 49 МБ. Очистите логи в системных настройках "
+            "или уменьшите лимит автоочистки."
+        )
+        return
+    document = BufferedInputFile(archive, filename="moneybot_logs.zip")
+    await message.answer_document(
+        document,
+        caption=(
+            f"Логов в архиве: {count}\n"
+            f"Размер до сжатия: {format_bytes(source_size)}\n"
+            f"Размер ZIP: {format_bytes(len(archive))}"
         ),
-        image_link=None,
-        badge=None,
     )
-    await send_funpay_notification(bot, message.chat.id, sample, account_id, test=True)
-
-
-@router.callback_query(F.data == "fp:test_reply")
-async def callback_test_reply(callback: CallbackQuery) -> None:
-    await callback.answer("Это тестовое сообщение", show_alert=True)
+    await wait.delete()
 
 
 @router.callback_query(F.data.startswith("fp:reply:"))
@@ -1105,7 +1266,10 @@ async def callback_plugin_toggle(
 
 @router.callback_query(F.data == "menu:settings")
 async def callback_settings(
-    callback: CallbackQuery, state: FSMContext, automation: AutomationService
+    callback: CallbackQuery,
+    state: FSMContext,
+    automation: AutomationService,
+    system_settings: SystemSettingsService,
 ) -> None:
     await callback.answer()
     await state.clear()
@@ -1116,13 +1280,116 @@ async def callback_settings(
         notifications_status = (
             "включены" if settings["notifications"]["enabled"] else "выключены"
         )
+        logs_status = (
+            "включены"
+            if system_settings.get_settings()["logs_enabled"]
+            else "выключены"
+        )
         await callback.message.edit_text(
             "<b>Настройки</b>\n\n"
             f"Ответ на сообщения: {messages_status}\n"
             f"Ответ на отзывы: {reviews_status}\n"
-            f"Уведомления: {notifications_status}",
+            f"Уведомления: {notifications_status}\n"
+            f"Логи: {logs_status}",
             reply_markup=settings_menu(),
         )
+
+
+@router.callback_query(F.data == "settings:system")
+async def callback_system_settings(
+    callback: CallbackQuery,
+    state: FSMContext,
+    system_settings: SystemSettingsService,
+) -> None:
+    await callback.answer()
+    await state.clear()
+    if callback.message:
+        settings = system_settings.get_settings()
+        await callback.message.edit_text(
+            format_system_settings(system_settings),
+            reply_markup=system_settings_menu(settings),
+        )
+
+
+@router.callback_query(F.data == "settings:system:toggle_logs")
+async def callback_system_toggle_logs(
+    callback: CallbackQuery, system_settings: SystemSettingsService
+) -> None:
+    enabled = system_settings.toggle_logs()
+    await callback.answer("Логи включены" if enabled else "Логи выключены")
+    if callback.message:
+        await callback.message.edit_text(
+            format_system_settings(system_settings),
+            reply_markup=system_settings_menu(system_settings.get_settings()),
+        )
+
+
+@router.callback_query(F.data == "settings:system:resources")
+async def callback_system_resources(callback: CallbackQuery) -> None:
+    await callback.answer("Обновляю...")
+    if not callback.message:
+        return
+    await callback.message.edit_text("Собираю информацию о системе...")
+    try:
+        text = await asyncio.to_thread(collect_system_info)
+    except Exception as error:
+        text = (
+            "<b>Не удалось получить информацию о системе</b>\n"
+            + html.escape(str(error).splitlines()[0][:300])
+        )
+    await callback.message.edit_text(text, reply_markup=system_resources_menu())
+
+
+@router.callback_query(F.data == "settings:system:cleanup")
+async def callback_system_cleanup(
+    callback: CallbackQuery, system_settings: SystemSettingsService
+) -> None:
+    await callback.answer("Очищаю...")
+    result = await asyncio.to_thread(system_settings.cleanup_logs, True)
+    if callback.message:
+        await callback.message.edit_text(
+            format_system_settings(system_settings)
+            + "\n\n<b>Результат очистки</b>\n"
+            + format_cleanup_result(result),
+            reply_markup=system_settings_menu(system_settings.get_settings()),
+        )
+
+
+@router.callback_query(F.data == "settings:system:log_limit")
+async def callback_system_log_limit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    system_settings: SystemSettingsService,
+) -> None:
+    await callback.answer()
+    await state.set_state(SystemSettings.waiting_log_limit)
+    current = system_settings.get_settings()["max_log_size_mb"]
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Лимит размера логов</b>\n\n"
+            f"Сейчас: {current} МБ на один файл.\n"
+            "Отправьте новый лимит от 1 до 1024 МБ. "
+            "Файлы больше лимита автоматически очищаются раз в час.",
+            reply_markup=settings_cancel_menu("system"),
+        )
+
+
+@router.message(SystemSettings.waiting_log_limit, F.text)
+async def receive_system_log_limit(
+    message: Message,
+    state: FSMContext,
+    system_settings: SystemSettingsService,
+) -> None:
+    value = str(message.text or "").strip()
+    if not value.isdigit() or not 1 <= int(value) <= 1024:
+        await message.answer("Введите целое число от 1 до 1024.")
+        return
+    system_settings.set_max_log_size(int(value))
+    await state.clear()
+    await message.answer(
+        format_system_settings(system_settings),
+        reply_markup=system_settings_menu(system_settings.get_settings()),
+    )
 
 
 @router.callback_query(F.data == "settings:notifications")
@@ -1629,7 +1896,8 @@ async def configure_commands(
         "start": "Главное меню",
         "profile": "Аккаунт FunPay",
         "tickets": "Тикеты Support",
-        "testmessage": "Тест уведомления FunPay",
+        "system": "Ресурсы системы",
+        "log": "Скачать логи",
     }
     for plugin in plugin_manager.plugins.values():
         if not plugin.enabled:
@@ -1669,6 +1937,11 @@ async def run_bot(config: BotConfig) -> None:
     router.callback_query.outer_middleware(owner_middleware)
     dispatcher.include_router(router)
     dispatcher["config"] = config
+    system_settings = SystemSettingsService()
+    system_settings.cleanup_logs()
+    system_settings.apply_logging()
+    system_settings.start_cleanup_worker()
+    dispatcher["system_settings"] = system_settings
     dispatcher["funpay"] = FunPayService(config.golden_key)
     dispatcher["ticket_client"] = TicketClient(
         config.golden_key, config.support_phpsessid

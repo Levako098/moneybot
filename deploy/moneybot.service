@@ -1,0 +1,24 @@
+[Unit]
+Description=MoneyBot FunPay Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moneybot
+Group=moneybot
+WorkingDirectory=/opt/moneybot
+ExecStart=/opt/moneybot/start.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+Environment=PYTHON_BIN=python3.11
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
