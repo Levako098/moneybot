@@ -136,6 +136,7 @@ class PluginManager:
         self.new_message_handlers: list[Callable] = []
         self.new_order_handlers: list[Callable] = []
         self.funpay_message_observers: list[Callable] = []
+        self.funpay_order_observers: list[Callable] = []
         self.telegram = CompatTelegram(token, owner_id, self)
         self.account: Account | None = None
         self.runner: Runner | None = None
@@ -633,6 +634,10 @@ class PluginManager:
         if observer not in self.funpay_message_observers:
             self.funpay_message_observers.append(observer)
 
+    def add_funpay_order_observer(self, observer: Callable) -> None:
+        if observer not in self.funpay_order_observers:
+            self.funpay_order_observers.append(observer)
+
     def send_message(self, chat_id: int, text: str) -> Any:
         if not self.account:
             raise RuntimeError("FunPay account is not initialized")
@@ -690,6 +695,12 @@ class PluginManager:
                                 observer(event)
                             except Exception:
                                 logger.exception("Ошибка observer сообщения FunPay")
+                    if name == "NewOrderEvent":
+                        for observer in list(self.funpay_order_observers):
+                            try:
+                                observer(event)
+                            except Exception:
+                                logger.exception("Ошибка observer заказа FunPay")
                     handlers = (
                         self.new_message_handlers if "Message" in name else
                         self.new_order_handlers if "Order" in name else []

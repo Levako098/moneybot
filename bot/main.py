@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import html
+import io
 import logging
 import re
 import sys
@@ -18,6 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardMarkup,
     Message,
@@ -27,6 +30,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import BotConfig, ConfigError, load_config
 from bot.funpay_service import FunPayService, FunPayServiceError, ProfileInfo
+from bot.services.auto_delivery import (
+    DELIVERY_VARIABLES,
+    AutoDeliveryService,
+    DeliveryResult,
+)
 from bot.services.automation import (
     MESSAGE_VARIABLES,
     NOTIFICATION_KEYS,
@@ -64,6 +72,10 @@ class AutomationSettings(StatesGroup):
     waiting_message_template = State()
     waiting_message_cooldown = State()
     waiting_review_template = State()
+
+
+class AutoDeliverySettings(StatesGroup):
+    waiting_text = State()
 
 
 class OwnerOnlyMiddleware(BaseMiddleware):
@@ -116,8 +128,9 @@ def account_root_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Информация", callback_data="account:info")
     builder.button(text="Ограничения", callback_data="account:restrictions")
+    builder.button(text="Лоты", callback_data="account:lots")
     builder.button(text="Назад", callback_data="menu:main")
-    builder.adjust(2, 1)
+    builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 
@@ -126,6 +139,64 @@ def restrictions_menu() -> InlineKeyboardMarkup:
     builder.button(text="Обновить", callback_data="account:restrictions")
     builder.button(text="Назад", callback_data="menu:account")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def lots_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Скачать список", callback_data="account:lots:download")
+    builder.button(text="Автовыдача", callback_data="account:delivery:page:0")
+    builder.button(text="Назад", callback_data="menu:account")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def delivery_list_menu(
+    rows: list[dict[str, Any]], page: int, page_size: int = 8
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(max(page, 0), total_pages - 1)
+    for row in rows[page * page_size:(page + 1) * page_size]:
+        marker = "🟢" if row["enabled"] else "🔴"
+        title = str(row["title"])
+        label = title[:35] + ("..." if len(title) > 35 else "")
+        builder.button(
+            text=f"{marker} {label}",
+            callback_data=f"account:delivery:lot:{row['lot_id']}:{page}",
+        )
+    if total_pages > 1:
+        previous_page = page - 1 if page > 0 else total_pages - 1
+        next_page = page + 1 if page + 1 < total_pages else 0
+        builder.button(text="◀", callback_data=f"account:delivery:page:{previous_page}")
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data="account:delivery:noop")
+        builder.button(text="▶", callback_data=f"account:delivery:page:{next_page}")
+    builder.button(text="Назад", callback_data="account:lots")
+    builder.adjust(*([1] * min(page_size, len(rows[page * page_size:(page + 1) * page_size]))), 3, 1)
+    return builder.as_markup()
+
+
+def delivery_detail_menu(lot_id: str, page: int, enabled: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Изменить текст" if enabled else "Настроить автовыдачу",
+        callback_data=f"account:delivery:set:{lot_id}:{page}",
+    )
+    if enabled:
+        builder.button(
+            text="Отключить",
+            callback_data=f"account:delivery:disable:{lot_id}:{page}",
+        )
+    builder.button(text="Назад", callback_data=f"account:delivery:page:{page}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def delivery_cancel_menu(lot_id: str, page: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Отмена", callback_data=f"account:delivery:lot:{lot_id}:{page}"
+    )
     return builder.as_markup()
 
 
@@ -354,6 +425,77 @@ def format_profile(profile: ProfileInfo) -> str:
     return "\n".join(lines)
 
 
+def build_delivery_rows(
+    lots: list[Any], rules: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    rows = []
+    current_ids = set()
+    for lot in lots:
+        metadata = AutoDeliveryService.lot_metadata(lot)
+        lot_id = metadata["lot_id"]
+        current_ids.add(lot_id)
+        metadata["enabled"] = lot_id in rules
+        metadata["active"] = True
+        rows.append(metadata)
+    for lot_id, rule in rules.items():
+        if lot_id in current_ids:
+            continue
+        stale = dict(rule)
+        stale["lot_id"] = lot_id
+        stale["enabled"] = True
+        stale["active"] = False
+        rows.append(stale)
+    return sorted(
+        rows,
+        key=lambda row: (
+            not bool(row.get("active")),
+            str(row.get("title") or "").casefold(),
+            str(row.get("lot_id") or ""),
+        ),
+    )
+
+
+def build_lots_csv(lots: list[Any]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, delimiter=";", lineterminator="\n")
+    writer.writerow(["ID", "Название", "Категория", "Подкатегория", "Цена", "Ссылка"])
+    for lot in lots:
+        metadata = AutoDeliveryService.lot_metadata(lot)
+        writer.writerow(
+            [
+                metadata["lot_id"],
+                metadata["title"],
+                metadata["category"],
+                metadata["subcategory"],
+                metadata["price"],
+                metadata["link"],
+            ]
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
+def format_delivery_detail(row: dict[str, Any], rule: dict[str, Any] | None) -> str:
+    active = "активен" if row.get("active") else "не найден среди активных"
+    lines = [
+        "<b>Автовыдача лота</b>",
+        "",
+        f"<b>ID:</b> <code>{html.escape(str(row['lot_id']))}</code>",
+        f"<b>Название:</b> {html.escape(str(row.get('title') or 'Без названия'))}",
+        f"<b>Категория:</b> {html.escape(str(row.get('category') or '—'))}",
+        f"<b>Статус лота:</b> {active}",
+        f"<b>Автовыдача:</b> {'включена' if rule else 'выключена'}",
+    ]
+    if rule:
+        lines.extend(
+            [
+                "",
+                "<b>Текст выдачи:</b>",
+                f"<code>{html.escape(str(rule.get('text') or ''))}</code>",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def format_funpay_message(message: Any, account_id: int | None) -> str:
     incoming = getattr(message, "author_id", None) != account_id
     author = html.escape(str(getattr(message, "author", None) or "FunPay"))
@@ -400,6 +542,31 @@ async def send_funpay_notification(
         format_funpay_message(message, account_id),
         reply_markup=funpay_chat_menu(getattr(message, "chat_id", ""), test=test),
     )
+
+
+async def send_delivery_result(
+    bot: Bot, owner_id: int, result: DeliveryResult
+) -> None:
+    if result.status == "delivered":
+        text = (
+            "<b>Автовыдача выполнена</b>\n\n"
+            f"Заказ: <code>#{html.escape(result.order_id)}</code>\n"
+            f"Лот: <code>{html.escape(str(result.lot_id or '—'))}</code>\n"
+            f"Покупатель: {html.escape(str(result.buyer_username or '—'))}"
+        )
+    elif result.status == "ambiguous":
+        text = (
+            "<b>Автовыдача не выполнена</b>\n\n"
+            f"Заказ: <code>#{html.escape(result.order_id)}</code>\n"
+            "Несколько настроенных лотов имеют одинаковое название и категорию."
+        )
+    else:
+        text = (
+            "<b>Ошибка автовыдачи</b>\n\n"
+            f"Заказ: <code>#{html.escape(result.order_id)}</code>\n"
+            f"Причина: {html.escape(str(result.error or 'неизвестная ошибка'))}"
+        )
+    await bot.send_message(owner_id, text)
 
 
 def format_cooldown(seconds: int) -> str:
@@ -696,6 +863,203 @@ async def callback_account_restrictions(
         reason = html.escape(str(error).splitlines()[0][:300])
         text = f"<b>Не удалось получить ограничения</b>\n{reason}"
     await callback.message.edit_text(text, reply_markup=restrictions_menu())
+
+
+@router.callback_query(F.data == "account:lots")
+async def callback_account_lots(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    await callback.answer("Загружаю...")
+    await state.clear()
+    if not callback.message:
+        return
+    try:
+        lots = await asyncio.to_thread(auto_delivery.get_lots, True)
+        configured = len(auto_delivery.get_rules())
+        text = (
+            "<b>Лоты FunPay</b>\n\n"
+            f"Активных лотов: {len(lots)}\n"
+            f"Настроено для автовыдачи: {configured}"
+        )
+    except Exception as error:
+        text = (
+            "<b>Не удалось получить лоты</b>\n"
+            + html.escape(str(error).splitlines()[0][:300])
+        )
+    await callback.message.edit_text(text, reply_markup=lots_menu())
+
+
+@router.callback_query(F.data == "account:lots:download")
+async def callback_lots_download(
+    callback: CallbackQuery, auto_delivery: AutoDeliveryService
+) -> None:
+    await callback.answer("Готовлю файл...")
+    if not callback.message:
+        return
+    try:
+        lots = await asyncio.to_thread(auto_delivery.get_lots, True)
+        document = BufferedInputFile(build_lots_csv(lots), filename="funpay_lots.csv")
+        await callback.message.answer_document(
+            document,
+            caption=f"Лоты FunPay: {len(lots)} шт. Названия и ID находятся в CSV-файле.",
+        )
+    except Exception as error:
+        await callback.message.answer(
+            "<b>Файл не создан</b>\n"
+            + html.escape(str(error).splitlines()[0][:300])
+        )
+
+
+@router.callback_query(F.data == "account:delivery:noop")
+async def callback_delivery_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("account:delivery:page:"))
+async def callback_delivery_page(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    page_text = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
+    page = int(page_text) if page_text.isdigit() else 0
+    await callback.answer("Загружаю...")
+    await state.clear()
+    if not callback.message:
+        return
+    try:
+        lots = await asyncio.to_thread(auto_delivery.get_lots)
+        rows = build_delivery_rows(lots, auto_delivery.get_rules())
+        total_pages = max(1, (len(rows) + 7) // 8)
+        page = min(page, total_pages - 1)
+        text = (
+            "<b>Автовыдача</b>\n\n"
+            "Выберите лот. 🟢 — настроен, 🔴 — выключен.\n"
+            "После новой покупки настроенный текст будет отправлен покупателю один раз."
+        )
+        await callback.message.edit_text(
+            text, reply_markup=delivery_list_menu(rows, page)
+        )
+    except Exception as error:
+        await callback.message.edit_text(
+            "<b>Не удалось получить лоты</b>\n"
+            + html.escape(str(error).splitlines()[0][:300]),
+            reply_markup=lots_menu(),
+        )
+
+
+@router.callback_query(F.data.regexp(r"^account:delivery:lot:[^:]+:\d+$"))
+async def callback_delivery_lot(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    parts = str(callback.data or "").split(":")
+    lot_id, page = parts[-2], int(parts[-1])
+    await callback.answer()
+    await state.clear()
+    if not callback.message:
+        return
+    lots = await asyncio.to_thread(auto_delivery.get_lots)
+    rows = build_delivery_rows(lots, auto_delivery.get_rules())
+    row = next((item for item in rows if item["lot_id"] == lot_id), None)
+    if row is None:
+        await callback.message.edit_text(
+            "Лот не найден.", reply_markup=delivery_list_menu(rows, page)
+        )
+        return
+    rule = auto_delivery.get_rule(lot_id)
+    await callback.message.edit_text(
+        format_delivery_detail(row, rule),
+        reply_markup=delivery_detail_menu(lot_id, page, rule is not None),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^account:delivery:set:[^:]+:\d+$"))
+async def callback_delivery_set(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    parts = str(callback.data or "").split(":")
+    lot_id, page = parts[-2], int(parts[-1])
+    lots = await asyncio.to_thread(auto_delivery.get_lots)
+    lot = next((item for item in lots if str(item.id) == lot_id), None)
+    rule = auto_delivery.get_rule(lot_id)
+    if lot is None and rule is None:
+        await callback.answer("Лот не найден", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(AutoDeliverySettings.waiting_text)
+    await state.update_data(delivery_lot_id=lot_id, delivery_page=page)
+    variables = " ".join(f"<code>{{{name}}}</code>" for name in DELIVERY_VARIABLES)
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Текст автовыдачи</b>\n\n"
+            "Отправьте строку, которая будет автоматически выдана покупателю. "
+            "Максимум 4000 символов.\n\n"
+            f"<b>Переменные:</b>\n{variables}",
+            reply_markup=delivery_cancel_menu(lot_id, page),
+        )
+
+
+@router.message(AutoDeliverySettings.waiting_text, F.text)
+async def receive_delivery_text(
+    message: Message,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    text = str(message.text or "").strip()
+    if not text:
+        await message.answer("Текст автовыдачи не может быть пустым.")
+        return
+    if len(text) > 4000:
+        await message.answer("Текст слишком длинный. Максимум 4000 символов.")
+        return
+    data = await state.get_data()
+    lot_id = str(data.get("delivery_lot_id") or "")
+    page = int(data.get("delivery_page") or 0)
+    lots = await asyncio.to_thread(auto_delivery.get_lots)
+    lot = next((item for item in lots if str(item.id) == lot_id), None)
+    if lot is not None:
+        auto_delivery.set_rule(lot, text)
+        row = AutoDeliveryService.lot_metadata(lot)
+        row.update({"active": True, "enabled": True})
+    elif auto_delivery.update_rule_text(lot_id, text):
+        row = dict(auto_delivery.get_rule(lot_id) or {})
+        row.update({"lot_id": lot_id, "active": False, "enabled": True})
+    else:
+        await state.clear()
+        await message.answer("Лот больше не найден. Откройте список заново.")
+        return
+    await state.clear()
+    rule = auto_delivery.get_rule(lot_id)
+    await message.answer(
+        format_delivery_detail(row, rule),
+        reply_markup=delivery_detail_menu(lot_id, page, True),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^account:delivery:disable:[^:]+:\d+$"))
+async def callback_delivery_disable(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    parts = str(callback.data or "").split(":")
+    lot_id, page = parts[-2], int(parts[-1])
+    auto_delivery.delete_rule(lot_id)
+    await state.clear()
+    await callback.answer("Автовыдача отключена")
+    if callback.message:
+        lots = await asyncio.to_thread(auto_delivery.get_lots)
+        rows = build_delivery_rows(lots, auto_delivery.get_rules())
+        await callback.message.edit_text(
+            "<b>Автовыдача</b>\n\nВыберите лот.",
+            reply_markup=delivery_list_menu(rows, page),
+        )
 
 
 @router.callback_query(F.data.in_({"menu:plugins", "plugins:refresh"}))
@@ -1314,6 +1678,8 @@ async def run_bot(config: BotConfig) -> None:
     dispatcher["plugin_manager"] = plugin_manager
     automation = AutomationService(plugin_manager.account)
     dispatcher["automation"] = automation
+    auto_delivery = AutoDeliveryService(plugin_manager.account)
+    dispatcher["auto_delivery"] = auto_delivery
 
     event_loop = asyncio.get_running_loop()
 
@@ -1336,8 +1702,25 @@ async def run_bot(config: BotConfig) -> None:
 
         future.add_done_callback(log_notification_result)
 
+    def handle_auto_delivery(event: Any) -> None:
+        result = auto_delivery.handle_event(event)
+        if result is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            send_delivery_result(bot, config.owner_id, result), event_loop
+        )
+
+        def log_delivery_result(notification: Any) -> None:
+            try:
+                notification.result()
+            except Exception:
+                logger.exception("Не удалось отправить результат автовыдачи в Telegram")
+
+        future.add_done_callback(log_delivery_result)
+
     plugin_manager.add_funpay_message_observer(automation.handle_event)
     plugin_manager.add_funpay_message_observer(notify_funpay_message)
+    plugin_manager.add_funpay_order_observer(handle_auto_delivery)
     plugin_manager.activate_runner()
 
     await configure_commands(bot, config.owner_id, plugin_manager)
