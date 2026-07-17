@@ -38,6 +38,7 @@ from bot.services.auto_delivery import (
     DELIVERY_VARIABLES,
     AutoDeliveryService,
     DeliveryResult,
+    RaiseLotsResult,
 )
 from bot.services.auto_tickets import AutoTicketResult, AutoTicketService
 from bot.services.automation import (
@@ -52,7 +53,12 @@ from bot.services.tickets import (
     TicketError,
 )
 from bot.services.plugin_manager import PluginManager, PluginRecord
-from bot.services.system_settings import CleanupResult, SystemSettingsService
+from bot.services.system_settings import (
+    CleanupResult,
+    ResourceWarning,
+    SystemSettingsService,
+    TemporaryCleanupResult,
+)
 
 
 LOG_PATH = Path(__file__).resolve().parent / "data" / "moneybot.log"
@@ -234,8 +240,17 @@ def settings_menu() -> InlineKeyboardMarkup:
     builder.button(text="Ответ на отзывы", callback_data="settings:reviews")
     builder.button(text="Уведомления", callback_data="settings:notifications")
     builder.button(text="Системные настройки", callback_data="settings:system")
+    builder.button(text="Поднять все лоты", callback_data="settings:lots:raise")
     builder.button(text="Назад", callback_data="menu:main")
-    builder.adjust(2, 1, 1, 1)
+    builder.adjust(2, 1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def raise_lots_confirm_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Поднять", callback_data="settings:lots:raise:confirm")
+    builder.button(text="Отмена", callback_data="menu:settings")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -323,6 +338,17 @@ def system_resources_menu() -> InlineKeyboardMarkup:
     builder.button(text="Обновить", callback_data="settings:system:resources")
     builder.button(text="Назад", callback_data="settings:system")
     builder.adjust(2)
+    return builder.as_markup()
+
+
+def resource_warning_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Очистить временные файлы",
+        callback_data="system:resources:cleanup",
+    )
+    builder.button(text="Проверить ресурсы", callback_data="settings:system:resources")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -800,7 +826,7 @@ def format_system_settings(system_settings: SystemSettingsService) -> str:
         f"<b>Автоочистка:</b> при размере файла больше "
         f"{settings['max_log_size_mb']} МБ\n"
         "<b>Проверка:</b> один раз в час\n\n"
-        "Здесь можно посмотреть ресурсы сервера, отключить запись логов или очистить их."
+        "Бот также проверяет RAM и диск каждые 5 минут и предупреждает при загрузке от 90%."
     )
 
 
@@ -870,6 +896,53 @@ def format_cleanup_result(result: CleanupResult) -> str:
     if result.files_failed:
         text += f"\nНе удалось очистить: {result.files_failed}"
     return text
+
+
+def format_temporary_cleanup_result(result: TemporaryCleanupResult) -> str:
+    text = (
+        "<b>Временные файлы очищены</b>\n\n"
+        f"Каталогов кеша: {result.cache_directories_cleaned}\n"
+        f"Файлов кеша: {result.cache_files_cleaned}\n"
+        f"Файлов логов: {result.log_files_cleaned}\n"
+        f"Освобождено: {format_bytes(result.bytes_freed)}"
+    )
+    if result.files_failed:
+        text += f"\nНе удалось очистить: {result.files_failed}"
+    return text
+
+
+def format_resource_warning(warning: ResourceWarning) -> str:
+    reasons = ", ".join(warning.reasons)
+    return (
+        "<b>На сервере осталось мало ресурсов</b>\n\n"
+        f"Проблема: {html.escape(reasons)}\n"
+        f"RAM занято: {warning.memory_percent:.1f}%\n"
+        f"RAM доступно: {format_bytes(warning.memory_available)}\n"
+        f"Диск {html.escape(warning.disk_path)} занят: {warning.disk_percent:.1f}%\n"
+        f"На диске свободно: {format_bytes(warning.disk_free)}\n\n"
+        "Кнопка очистит кеши и логи MoneyBot. Системные и чужие файлы не удаляются."
+    )
+
+
+def format_raise_lots_result(result: RaiseLotsResult) -> str:
+    if result.status == "busy":
+        return "Поднятие лотов уже выполняется."
+    if result.status == "empty":
+        return "Активные лоты не найдены."
+
+    lines = [
+        "<b>Поднятие лотов завершено</b>",
+        "",
+        f"Активных лотов: {result.total_lots}",
+        f"Категорий поднято: {result.categories_raised} из {result.categories_total}",
+    ]
+    if result.errors:
+        lines.extend(["", "<b>Не удалось поднять:</b>"])
+        for category, reason in result.errors[:10]:
+            lines.append(f"• {html.escape(category)}: {html.escape(reason)}")
+        if len(result.errors) > 10:
+            lines.append(f"• и ещё {len(result.errors) - 10}")
+    return "\n".join(lines)
 
 
 def format_bytes(value: int) -> str:
@@ -1562,6 +1635,67 @@ async def callback_system_cleanup(
             + format_cleanup_result(result),
             reply_markup=system_settings_menu(system_settings.get_settings()),
         )
+
+
+@router.callback_query(F.data == "system:resources:cleanup")
+async def callback_system_temporary_cleanup(
+    callback: CallbackQuery, system_settings: SystemSettingsService
+) -> None:
+    await callback.answer("Очищаю кеши и логи...")
+    if not callback.message:
+        return
+    await callback.message.edit_text("Очищаю временные файлы MoneyBot...")
+    result = await asyncio.to_thread(system_settings.cleanup_temporary_files)
+    await callback.message.edit_text(
+        format_temporary_cleanup_result(result),
+        reply_markup=system_resources_menu(),
+    )
+
+
+@router.callback_query(F.data == "settings:lots:raise")
+async def callback_raise_lots_prompt(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_delivery: AutoDeliveryService,
+) -> None:
+    await callback.answer()
+    await state.clear()
+    if not callback.message:
+        return
+    try:
+        lots = await asyncio.to_thread(auto_delivery.get_lots, True)
+        if not lots:
+            await callback.message.edit_text(
+                "Активные лоты не найдены.", reply_markup=settings_menu()
+            )
+            return
+        await callback.message.edit_text(
+            "<b>Поднять все лоты?</b>\n\n"
+            f"Активных лотов: {len(lots)}\n"
+            "Будут подняты все категории, в которых есть ваши активные лоты.\n"
+            "FunPay может ограничить частоту поднятия.",
+            reply_markup=raise_lots_confirm_menu(),
+        )
+    except Exception as error:
+        await callback.message.edit_text(
+            "<b>Не удалось получить активные лоты</b>\n"
+            + html.escape(str(error).splitlines()[0][:300]),
+            reply_markup=settings_menu(),
+        )
+
+
+@router.callback_query(F.data == "settings:lots:raise:confirm")
+async def callback_raise_lots_confirm(
+    callback: CallbackQuery, auto_delivery: AutoDeliveryService
+) -> None:
+    await callback.answer("Поднимаю лоты...")
+    if not callback.message:
+        return
+    await callback.message.edit_text("Поднимаю все активные лоты через FunPay...")
+    result = await asyncio.to_thread(auto_delivery.raise_all_lots)
+    await callback.message.edit_text(
+        format_raise_lots_result(result), reply_markup=settings_menu()
+    )
 
 
 @router.callback_query(F.data == "settings:system:log_limit")
@@ -2429,6 +2563,26 @@ async def run_bot(config: BotConfig) -> None:
 
     event_loop = asyncio.get_running_loop()
 
+    def notify_resource_warning(warning: ResourceWarning) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(
+                config.owner_id,
+                format_resource_warning(warning),
+                reply_markup=resource_warning_menu(),
+            ),
+            event_loop,
+        )
+
+        def log_resource_warning_result(notification: Any) -> None:
+            try:
+                notification.result()
+            except Exception:
+                logger.exception(
+                    "Не удалось отправить предупреждение о ресурсах в Telegram"
+                )
+
+        future.add_done_callback(log_resource_warning_result)
+
     def notify_funpay_message(event: Any) -> None:
         if not automation.should_notify(event.message):
             return
@@ -2491,6 +2645,7 @@ async def run_bot(config: BotConfig) -> None:
     plugin_manager.add_funpay_message_observer(notify_funpay_message)
     plugin_manager.add_funpay_order_observer(handle_auto_delivery)
     plugin_manager.activate_runner()
+    system_settings.start_resource_monitor(notify_resource_warning)
     auto_tickets.set_result_callback(notify_auto_ticket)
     auto_tickets.start()
 

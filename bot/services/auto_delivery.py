@@ -34,6 +34,15 @@ class DeliveryResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class RaiseLotsResult:
+    status: str
+    total_lots: int = 0
+    categories_total: int = 0
+    categories_raised: int = 0
+    errors: tuple[tuple[str, str], ...] = ()
+
+
 def _normalize(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
@@ -43,6 +52,7 @@ class AutoDeliveryService:
         self.account = account
         self.path = path
         self._lock = threading.RLock()
+        self._raise_lock = threading.Lock()
         self._in_progress: set[str] = set()
         self._lots_cache: list[Any] = []
         self._lots_cached_at = 0.0
@@ -97,6 +107,80 @@ class AutoDeliveryService:
             self._lots_cache = list(lots)
             self._lots_cached_at = time.monotonic()
         return lots
+
+    def raise_all_lots(self) -> RaiseLotsResult:
+        if not self._raise_lock.acquire(blocking=False):
+            return RaiseLotsResult("busy")
+        try:
+            lots = self.get_lots(refresh=True)
+            categories: dict[int, dict[str, Any]] = {}
+            for lot in lots:
+                subcategory = getattr(lot, "subcategory", None)
+                category = getattr(subcategory, "category", None)
+                category_id = getattr(category, "id", None)
+                subcategory_id = getattr(subcategory, "id", None)
+                subcategory_type = getattr(subcategory, "type", None)
+                type_name = str(getattr(subcategory_type, "name", "")).upper()
+                if type_name and type_name != "COMMON":
+                    continue
+                if category_id is None or subcategory_id is None:
+                    continue
+                row = categories.setdefault(
+                    int(category_id),
+                    {
+                        "name": str(getattr(category, "name", None) or category_id),
+                        "subcategories": set(),
+                    },
+                )
+                row["subcategories"].add(int(subcategory_id))
+
+            if not lots:
+                return RaiseLotsResult("empty")
+            if not categories:
+                return RaiseLotsResult(
+                    "error",
+                    total_lots=len(lots),
+                    errors=(("FunPay", "Не найдены категории лотов, доступные для поднятия"),),
+                )
+
+            raised = 0
+            errors = []
+            for category_id, row in sorted(categories.items()):
+                try:
+                    self.account.raise_lots(
+                        category_id,
+                        sorted(row["subcategories"]),
+                    )
+                    raised += 1
+                except Exception as error:
+                    reason = str(error).splitlines()[0].strip()
+                    errors.append(
+                        (
+                            str(row["name"]),
+                            reason[:300] if reason else type(error).__name__,
+                        )
+                    )
+                    logger.exception(
+                        "Не удалось поднять лоты категории %s", row["name"]
+                    )
+
+            status = "raised" if not errors else "partial" if raised else "error"
+            return RaiseLotsResult(
+                status,
+                total_lots=len(lots),
+                categories_total=len(categories),
+                categories_raised=raised,
+                errors=tuple(errors),
+            )
+        except Exception as error:
+            reason = str(error).splitlines()[0].strip()
+            logger.exception("Не удалось получить активные лоты для поднятия")
+            return RaiseLotsResult(
+                "error",
+                errors=(("FunPay", reason[:300] if reason else type(error).__name__),),
+            )
+        finally:
+            self._raise_lock.release()
 
     @staticmethod
     def lot_metadata(lot: Any) -> dict[str, Any]:

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import psutil
 
 
 logger = logging.getLogger("moneybot.system")
@@ -15,6 +19,10 @@ DEFAULT_SETTINGS = {
     "logs_enabled": True,
     "max_log_size_mb": 10,
 }
+RESOURCE_CHECK_INTERVAL_SECONDS = 300
+RESOURCE_WARNING_PERCENT = 90.0
+CACHE_DIRECTORY_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+EXCLUDED_DIRECTORY_NAMES = {".git", ".venv", "venv"}
 
 
 @dataclass(frozen=True)
@@ -24,11 +32,31 @@ class CleanupResult:
     files_failed: int
 
 
+@dataclass(frozen=True)
+class TemporaryCleanupResult:
+    cache_directories_cleaned: int
+    cache_files_cleaned: int
+    log_files_cleaned: int
+    bytes_freed: int
+    files_failed: int
+
+
+@dataclass(frozen=True)
+class ResourceWarning:
+    memory_percent: float
+    memory_available: int
+    disk_percent: float
+    disk_free: int
+    disk_path: str
+    reasons: tuple[str, ...]
+
+
 class SystemSettingsService:
     def __init__(self, path: Path = SYSTEM_SETTINGS_PATH) -> None:
         self.path = path
         self._lock = threading.RLock()
         self._worker_started = False
+        self._resource_worker_started = False
         self._stop_event = threading.Event()
         self._settings = self._load()
 
@@ -103,6 +131,65 @@ class SystemSettingsService:
     def get_log_files(self) -> list[Path]:
         return self._log_files()
 
+    def cleanup_temporary_files(self) -> TemporaryCleanupResult:
+        cache_directories = 0
+        cache_files = 0
+        freed = 0
+        failed = 0
+
+        for current, directories, _ in os.walk(ROOT, topdown=True):
+            directories[:] = [
+                name for name in directories if name not in EXCLUDED_DIRECTORY_NAMES
+            ]
+            for name in list(directories):
+                if name not in CACHE_DIRECTORY_NAMES:
+                    continue
+                path = Path(current) / name
+                try:
+                    files = [item for item in path.rglob("*") if item.is_file()]
+                    size = sum(item.stat().st_size for item in files)
+                    if path.is_symlink():
+                        path.unlink()
+                    else:
+                        shutil.rmtree(path)
+                    directories.remove(name)
+                    cache_directories += 1
+                    cache_files += len(files)
+                    freed += size
+                except OSError:
+                    failed += 1
+                    logger.exception("Не удалось удалить временный каталог %s", path)
+
+        log_result = self.cleanup_logs(force=True)
+        return TemporaryCleanupResult(
+            cache_directories,
+            cache_files,
+            log_result.files_cleaned,
+            freed + log_result.bytes_freed,
+            failed + log_result.files_failed,
+        )
+
+    @staticmethod
+    def get_resource_warning() -> ResourceWarning | None:
+        memory = psutil.virtual_memory()
+        disk_path = ROOT.anchor or "/"
+        disk = psutil.disk_usage(disk_path)
+        reasons = []
+        if float(memory.percent) >= RESOURCE_WARNING_PERCENT:
+            reasons.append("оперативная память")
+        if float(disk.percent) >= RESOURCE_WARNING_PERCENT:
+            reasons.append("диск")
+        if not reasons:
+            return None
+        return ResourceWarning(
+            float(memory.percent),
+            int(memory.available),
+            float(disk.percent),
+            int(disk.free),
+            str(disk_path),
+            tuple(reasons),
+        )
+
     def _log_files(self) -> list[Path]:
         result = set()
         for directory in (ROOT / "bot", ROOT / "plugins", ROOT / "data"):
@@ -127,4 +214,33 @@ class SystemSettingsService:
             target=worker,
             daemon=True,
             name="moneybot-log-cleanup",
+        ).start()
+
+    def start_resource_monitor(
+        self, callback: Callable[[ResourceWarning], None]
+    ) -> None:
+        with self._lock:
+            if self._resource_worker_started:
+                return
+            self._resource_worker_started = True
+
+        def worker() -> None:
+            warning_active = False
+            while not self._stop_event.is_set():
+                try:
+                    warning = self.get_resource_warning()
+                    if warning is None:
+                        warning_active = False
+                    elif not warning_active:
+                        callback(warning)
+                        warning_active = True
+                except Exception:
+                    logger.exception("Не удалось проверить ресурсы системы")
+                if self._stop_event.wait(RESOURCE_CHECK_INTERVAL_SECONDS):
+                    break
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="moneybot-resource-monitor",
         ).start()
