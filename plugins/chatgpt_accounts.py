@@ -14,7 +14,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 NAME = "ChatGPT Accounts Auto Delivery"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESCRIPTION = (
     "Автоматически выдаёт аккаунты ChatGPT из очереди после оплаты заказа "
     "по выбранному lot ID. Аккаунты можно загрузить документом или текстом."
@@ -35,6 +35,7 @@ def _default() -> dict[str, Any]:
         "enabled": True,
         "lot_id": "",
         "lot_title": "",
+        "account_format": [],
         "template": "Спасибо за покупку!\n\nАккаунт ChatGPT:\n{account}\n\nЗаказ: #{order_id}",
         "accounts": [],
         "delivered_orders": [],
@@ -52,8 +53,21 @@ def _load() -> dict[str, Any]:
     data["enabled"] = bool(data.get("enabled", True))
     data["lot_id"] = str(data.get("lot_id") or "").strip()
     data["lot_title"] = str(data.get("lot_title") or "").strip()
+    data["account_format"] = [
+        str(item).strip() for item in data.get("account_format", []) if str(item).strip()
+    ]
     data["template"] = str(data.get("template") or _default()["template"]).strip()
-    data["accounts"] = [str(item).strip() for item in data.get("accounts", []) if str(item).strip()]
+    accounts = []
+    for item in data.get("accounts", []):
+        if isinstance(item, dict):
+            raw = str(item.get("raw") or item.get("account") or "").strip()
+            fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+            fields = {str(key): str(value) for key, value in fields.items()}
+        else:
+            raw, fields = str(item).strip(), {}
+        if raw:
+            accounts.append({"raw": raw, "fields": fields})
+    data["accounts"] = accounts
     data["delivered_orders"] = [str(item).upper() for item in data.get("delivered_orders", [])]
     return data
 
@@ -94,6 +108,7 @@ def _menu_text(data: dict[str, Any]) -> str:
         f"Аккаунтов в очереди: <b>{len(data['accounts'])}</b>\n"
         f"Автовыдача: <b>{status}</b>\n\n"
         "Один аккаунт = одна непустая строка файла.\n"
+        f"Формат: <code>{html.escape(':'.join(data['account_format']) or 'целая строка')}</code>\n"
         f"Шаблон: <code>{html.escape(data['template'][:180])}</code>"
     )
 
@@ -125,8 +140,31 @@ def _prompt(cardinal: Any, call: Any, state: str, text: str) -> None:
     )
 
 
-def _parse_accounts(text: str) -> list[str]:
-    return [line.strip() for line in str(text).splitlines() if line.strip()]
+def _parse_format(text: str) -> list[str]:
+    names = [part.strip() for part in str(text).split(":") if part.strip()]
+    if not names or len(names) > 30:
+        raise ValueError("укажите от 1 до 30 полей через двоеточие")
+    if any(not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9_]+", name) for name in names):
+        raise ValueError("имена полей могут содержать только буквы, цифры и _")
+    if len(set(names)) != len(names):
+        raise ValueError("имена полей не должны повторяться")
+    return names
+
+
+def _parse_accounts(text: str, names: list[str]) -> list[dict[str, Any]]:
+    accounts = []
+    for line_number, line in enumerate(
+        (item.strip() for item in str(text).splitlines()), start=1
+    ):
+        if not line:
+            continue
+        values = line.split(":")
+        if len(values) != len(names):
+            raise ValueError(
+                f"строка {line_number}: ожидалось {len(names)} полей, разделённых :"
+            )
+        accounts.append({"raw": line, "fields": dict(zip(names, values))})
+    return accounts
 
 
 TEMPLATE_HELP = (
@@ -149,15 +187,18 @@ class _TemplateValues(dict[str, Any]):
 
 def _format_account(
     template: str,
-    account: str,
+    account: Any,
     order: Any,
     lot_id: str,
     amount: int,
     position: int,
 ) -> str:
     buyer = str(getattr(order, "buyer_username", "") or "")
+    raw = str(account.get("raw") if isinstance(account, dict) else account)
+    fields = account.get("fields", {}) if isinstance(account, dict) else {}
     values = _TemplateValues(
-        account=account,
+        account=raw,
+        raw=raw,
         username=buyer,
         buyer=buyer,
         order_id=str(getattr(order, "id", "") or ""),
@@ -167,10 +208,12 @@ def _format_account(
         total=amount,
         lot=str(getattr(order, "title", None) or getattr(order, "short_description", None) or ""),
     )
-    try:
-        return template.format_map(values).strip()
-    except (KeyError, ValueError, IndexError):
-        return template.replace("{account}", account).strip()
+    values.update(fields)
+    return re.sub(
+        r"\{([A-Za-zА-Яа-яЁё0-9_]+)\}",
+        lambda match: str(values.get(match.group(1), match.group(0))),
+        template,
+    ).strip()
 
 
 def _lot_id(order: Any) -> str:
@@ -193,7 +236,7 @@ def _send_accounts(
     cardinal: Any,
     order: Any,
     shortcut: Any,
-    accounts: list[str],
+    accounts: list[Any],
     template: str,
     lot_id: str,
 ) -> None:
@@ -287,6 +330,23 @@ def _on_message(cardinal: Any, message: Any) -> None:
             _save(data)
         cardinal.telegram.clear_state(message.chat.id, message.from_user.id)
         _show_settings(cardinal, message.chat.id)
+    elif mode == "cg_format":
+        try:
+            names = _parse_format(getattr(message, "text", "") or "")
+        except ValueError as error:
+            cardinal.telegram.bot.send_message(message.chat.id, f"Неверный формат: {error}")
+            return
+        with LOCK:
+            data = _load()
+            data["account_format"] = names
+            _save(data)
+        cardinal.telegram.set_state(
+            message.chat.id, message.id, message.from_user.id, "cg_accounts"
+        )
+        cardinal.telegram.bot.send_message(
+            message.chat.id,
+            "Формат сохранён: " + ":".join(names) + "\nТеперь отправьте .txt/.csv или аккаунты текстом.",
+        )
     elif mode == "cg_accounts":
         text = str(getattr(message, "text", "") or "")
         if getattr(message, "document", None) is not None:
@@ -296,7 +356,14 @@ def _on_message(cardinal: Any, message: Any) -> None:
             except Exception as error:
                 cardinal.telegram.bot.send_message(message.chat.id, f"Не удалось прочитать файл: {error}")
                 return
-        accounts = _parse_accounts(text)
+        try:
+            names = _load()["account_format"]
+            if not names:
+                raise ValueError("сначала укажите формат аккаунтов")
+            accounts = _parse_accounts(text, names)
+        except ValueError as error:
+            cardinal.telegram.bot.send_message(message.chat.id, f"Аккаунты не загружены: {error}")
+            return
         if not accounts:
             cardinal.telegram.bot.send_message(message.chat.id, "Файл или сообщение не содержит аккаунтов.")
             return
@@ -356,15 +423,26 @@ def _on_callback(cardinal: Any, call: Any) -> None:
                 )
         _show_settings(cardinal, call.message.chat.id, call.message.id)
     elif action == "upload":
-        _prompt(cardinal, call, "cg_accounts", "Отправьте .txt/.csv документ или аккаунты текстом, по одному в строке.")
+        _prompt(
+            cardinal,
+            call,
+            "cg_format",
+            "Сначала укажите формат одной строки аккаунта.\n\n"
+            "Пример: mail:password:2facode:2falinkactivator\n"
+            "Имена полей станут переменными шаблона: {mail}, {password}, {2facode}, {2falinkactivator}.",
+        )
     elif action == "template":
         with LOCK:
-            current = _load()["template"]
+            data = _load()
+            current = data["template"]
+            custom = ": ".join("{" + name + "}" for name in data["account_format"])
         _prompt(
             cardinal,
             call,
             "cg_template",
-            f"{TEMPLATE_HELP}\n\nТекущий шаблон:\n{current}\n\nОтправьте новый шаблон одним сообщением.",
+            f"{TEMPLATE_HELP}\n"
+            f"Поля аккаунта: {custom or 'формат ещё не задан'}\n\n"
+            f"Текущий шаблон:\n{current}\n\nОтправьте новый шаблон одним сообщением.",
         )
     elif action == "toggle":
         with LOCK:
