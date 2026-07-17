@@ -1049,6 +1049,9 @@ def format_raise_lots_result(result: RaiseLotsResult) -> str:
         f"Активных лотов: {result.total_lots}",
         f"Категорий поднято: {result.categories_raised} из {result.categories_total}",
     ]
+    if result.raised_categories:
+        lines.extend(["", "<b>Поднятые категории:</b>"])
+        lines.extend(f"• {html.escape(category)}" for category in result.raised_categories)
     if result.errors:
         lines.extend(["", "<b>Не удалось поднять:</b>"])
         for category, reason in result.errors[:10]:
@@ -3179,7 +3182,14 @@ async def run_bot(config: BotConfig) -> None:
                         config.owner_id,
                         "✅ <b>Лоты подняты автоматически</b>\n\n"
                         f"Категорий поднято: {result.categories_raised} из {result.categories_total}\n"
-                        f"Активных лотов: {result.total_lots}",
+                        f"Активных лотов: {result.total_lots}"
+                        + ("\n\n<b>Поднятые категории:</b>\n" + "\n".join(
+                            f"• {html.escape(category)}" for category in result.raised_categories
+                        ) if result.raised_categories else "")
+                        + ("\n\n<b>Не подняты:</b>\n" + "\n".join(
+                            f"• {html.escape(category)}: {html.escape(reason)}"
+                            for category, reason in result.errors
+                        ) if result.errors else ""),
                     )
             except Exception:
                 logger.exception("Не удалось автоматически поднять лоты")

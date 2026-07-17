@@ -40,6 +40,7 @@ class RaiseLotsResult:
     total_lots: int = 0
     categories_total: int = 0
     categories_raised: int = 0
+    raised_categories: tuple[str, ...] = ()
     errors: tuple[tuple[str, str], ...] = ()
 
 
@@ -144,6 +145,7 @@ class AutoDeliveryService:
                 )
 
             raised = 0
+            raised_categories = []
             errors = []
             for category_id, row in sorted(categories.items()):
                 try:
@@ -152,6 +154,7 @@ class AutoDeliveryService:
                         sorted(row["subcategories"]),
                     )
                     raised += 1
+                    raised_categories.append(str(row["name"]))
                 except Exception as error:
                     reason = str(error).splitlines()[0].strip()
                     errors.append(
@@ -170,6 +173,7 @@ class AutoDeliveryService:
                 total_lots=len(lots),
                 categories_total=len(categories),
                 categories_raised=raised,
+                raised_categories=tuple(raised_categories),
                 errors=tuple(errors),
             )
         except Exception as error:
