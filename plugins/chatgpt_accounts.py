@@ -14,7 +14,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 NAME = "ChatGPT Accounts Auto Delivery"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DESCRIPTION = (
     "Автоматически выдаёт аккаунты ChatGPT из очереди после оплаты заказа "
     "по выбранному lot ID. Аккаунты можно загрузить документом или текстом."
@@ -28,6 +28,7 @@ DATA_PATH = ROOT / "bot" / "data" / "chatgpt_accounts.json"
 LOGGER = logging.getLogger("moneybot.plugin.chatgpt_accounts")
 LOCK = threading.RLock()
 PROCESSING: set[str] = set()
+ACCOUNT_PAGE_SIZE = 8
 
 
 def _default() -> dict[str, Any]:
@@ -94,6 +95,7 @@ def _menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
         )
     )
     keyboard.row(InlineKeyboardButton("Очистить очередь", callback_data=f"47:{UUID}:clear"))
+    keyboard.row(InlineKeyboardButton("Удалить аккаунты выборочно", callback_data=f"47:{UUID}:accounts:0"))
     keyboard.row(InlineKeyboardButton("Закрыть", callback_data=f"47:{UUID}:close"))
     return keyboard
 
@@ -123,6 +125,53 @@ def _show_settings(cardinal: Any, chat_id: int, message_id: int | None = None) -
         cardinal.telegram.bot.edit_message_text(
             _menu_text(data), chat_id, message_id, **kwargs
         )
+
+
+def _accounts_view(data: dict[str, Any], page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total = len(data["accounts"])
+    pages = max(1, (total + ACCOUNT_PAGE_SIZE - 1) // ACCOUNT_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * ACCOUNT_PAGE_SIZE
+    end = min(total, start + ACCOUNT_PAGE_SIZE)
+    lines = [f"<b>Аккаунты в очереди</b> ({total})", ""]
+    if not total:
+        lines.append("Очередь пуста.")
+    else:
+        for index in range(start, end):
+            item = data["accounts"][index]
+            raw = item.get("raw", "") if isinstance(item, dict) else str(item)
+            lines.append(f"<b>#{index + 1}</b> <code>{html.escape(raw[:100])}</code>")
+    keyboard = InlineKeyboardMarkup()
+    for index in range(start, end):
+        item = data["accounts"][index]
+        raw = item.get("raw", "") if isinstance(item, dict) else str(item)
+        keyboard.row(
+            InlineKeyboardButton(
+                f"🗑 #{index + 1} {raw[:28]}",
+                callback_data=f"47:{UUID}:ask_delete:{index}",
+            )
+        )
+    if pages > 1:
+        keyboard.row(
+            InlineKeyboardButton("◀️", callback_data=f"47:{UUID}:accounts:{max(0, page - 1)}"),
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"47:{UUID}:accounts:{page}"),
+            InlineKeyboardButton("▶️", callback_data=f"47:{UUID}:accounts:{min(pages - 1, page + 1)}"),
+        )
+    keyboard.row(InlineKeyboardButton("Назад", callback_data=f"47:{UUID}:0"))
+    return "\n".join(lines), keyboard
+
+
+def _show_accounts(cardinal: Any, call: Any, page: int = 0) -> None:
+    with LOCK:
+        data = _load()
+    text, keyboard = _accounts_view(data, page)
+    cardinal.telegram.bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.id,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 def _prompt(cardinal: Any, call: Any, state: str, text: str) -> None:
@@ -393,7 +442,9 @@ def _on_message(cardinal: Any, message: Any) -> None:
 def _on_callback(cardinal: Any, call: Any) -> None:
     if not str(getattr(call, "data", "")).startswith(f"47:{UUID}"):
         return
-    action = str(call.data).split(":")[2] if len(str(call.data).split(":")) > 2 else ""
+    parts = str(call.data).split(":")
+    action = parts[2] if len(parts) > 2 else ""
+    argument = parts[3] if len(parts) > 3 else ""
     cardinal.telegram.bot.answer_callback_query(call.id)
     if action in {"", "0", "main"}:
         _show_settings(cardinal, call.message.chat.id, call.message.id)
@@ -431,6 +482,46 @@ def _on_callback(cardinal: Any, call: Any) -> None:
             "Пример: mail:password:2facode:2falinkactivator\n"
             "Имена полей станут переменными шаблона: {mail}, {password}, {2facode}, {2falinkactivator}.",
         )
+    elif action == "accounts":
+        try:
+            page = int(argument or 0)
+        except ValueError:
+            page = 0
+        _show_accounts(cardinal, call, page)
+    elif action == "ask_delete":
+        try:
+            index = int(argument)
+        except ValueError:
+            return
+        with LOCK:
+            data = _load()
+        if not 0 <= index < len(data["accounts"]):
+            _show_accounts(cardinal, call, 0)
+            return
+        item = data["accounts"][index]
+        raw = item.get("raw", "") if isinstance(item, dict) else str(item)
+        keyboard = InlineKeyboardMarkup().row(
+            InlineKeyboardButton("Удалить", callback_data=f"47:{UUID}:delete_account:{index}"),
+            InlineKeyboardButton("Отмена", callback_data=f"47:{UUID}:accounts:{index // ACCOUNT_PAGE_SIZE}"),
+        )
+        cardinal.telegram.bot.edit_message_text(
+            f"Удалить аккаунт <code>{html.escape(raw[:160])}</code>?",
+            call.message.chat.id,
+            call.message.id,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    elif action == "delete_account":
+        try:
+            index = int(argument)
+        except ValueError:
+            return
+        with LOCK:
+            data = _load()
+            if 0 <= index < len(data["accounts"]):
+                data["accounts"].pop(index)
+                _save(data)
+        _show_accounts(cardinal, call, index // ACCOUNT_PAGE_SIZE)
     elif action == "template":
         with LOCK:
             data = _load()
