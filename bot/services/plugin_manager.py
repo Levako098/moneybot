@@ -17,6 +17,7 @@ from typing import Any, Callable
 import telebot
 import requests
 from FunPayAPI import Account, Runner
+from FunPayAPI import types as funpay_types
 from FunPayAPI.common import exceptions as funpay_exceptions
 from bs4 import BeautifulSoup
 from telebot.types import CallbackQuery as TeleCallbackQuery
@@ -322,6 +323,99 @@ class PluginManager:
             return result
 
         self.account.method = MethodType(compatible_method, self.account)
+
+        def compatible_parse_messages(
+            account: Account,
+            json_messages: list[dict[str, Any]],
+            chat_id: int | str,
+            interlocutor_id: int | None = None,
+            interlocutor_username: str | None = None,
+            from_id: int = 0,
+        ) -> list[Any]:
+            messages = []
+            authors = {account.id: account.username, 0: "FunPay"}
+            badges: dict[int, str | int] = {}
+            if interlocutor_id is not None:
+                authors[interlocutor_id] = interlocutor_username
+
+            for raw_message in json_messages:
+                if raw_message["id"] < from_id:
+                    continue
+                author_id = raw_message["author"]
+                parser = BeautifulSoup(raw_message["html"], "html.parser")
+                author_div = parser.find("div", {"class": "media-user-name"})
+                if author_div is not None:
+                    badge = author_div.find("span")
+                    badges[author_id] = badge.get_text(strip=True) if badge else 0
+                    author_link = author_div.find("a")
+                    if author_link is not None:
+                        authors[author_id] = author_link.get_text(strip=True)
+                        if (
+                            account.chat_id_private(chat_id)
+                            and author_id == interlocutor_id
+                            and not interlocutor_username
+                        ):
+                            interlocutor_username = authors[author_id]
+
+                image_node = (
+                    parser.find("a", {"class": "chat-img-link"})
+                    if account.chat_id_private(chat_id)
+                    else None
+                )
+                if image_node is not None:
+                    image_link = image_node.get("href")
+                    message_text = None
+                else:
+                    image_link = None
+                    text_node = (
+                        parser.find("div", {"class": "message-text"})
+                        or parser.find("div", {"class": "chat-msg-text"})
+                    )
+                    if author_id == 0:
+                        text_node = (
+                            parser.find(
+                                "div", {"class": "alert alert-with-icon alert-info"}
+                            )
+                            or text_node
+                        )
+                    message_text = (
+                        text_node.get_text(" ", strip=True) if text_node is not None else ""
+                    )
+
+                by_bot = False
+                if message_text and message_text.startswith(account.bot_character):
+                    message_text = message_text.replace(account.bot_character, "", 1)
+                    by_bot = True
+
+                message = funpay_types.Message(
+                    raw_message["id"],
+                    message_text,
+                    chat_id,
+                    interlocutor_username,
+                    None,
+                    author_id,
+                    raw_message["html"],
+                    image_link,
+                    determine_msg_type=False,
+                )
+                message.by_bot = by_bot
+                message.type = (
+                    funpay_types.MessageTypes.NON_SYSTEM
+                    if author_id != 0
+                    else message.get_message_type()
+                )
+                messages.append(message)
+
+            for message in messages:
+                message.author = authors.get(message.author_id)
+                message.chat_name = interlocutor_username
+                badge = badges.get(message.author_id)
+                message.badge = badge if badge not in {None, 0} else None
+            return messages
+
+        self.account._Account__parse_messages = MethodType(
+            compatible_parse_messages, self.account
+        )
         if not hasattr(self.account, "get_sales"):
             self.account.get_sales = self.account.get_sells
         if not hasattr(self.account, "get_my_subcategory_lots"):

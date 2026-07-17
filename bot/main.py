@@ -92,8 +92,8 @@ def main_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Аккаунт", callback_data="menu:account")
     builder.button(text="Плагины", callback_data="menu:plugins")
-    builder.button(text="Настройки", callback_data="menu:settings")
     builder.button(text="Тикеты", callback_data="menu:tickets")
+    builder.button(text="Настройки", callback_data="menu:settings")
     builder.adjust(2, 2)
     return builder.as_markup()
 
