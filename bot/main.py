@@ -39,6 +39,7 @@ from bot.services.auto_delivery import (
     AutoDeliveryService,
     DeliveryResult,
 )
+from bot.services.auto_tickets import AutoTicketResult, AutoTicketService
 from bot.services.automation import (
     MESSAGE_VARIABLES,
     NOTIFICATION_KEYS,
@@ -96,6 +97,13 @@ class SystemSettings(StatesGroup):
 
 class PluginUpload(StatesGroup):
     waiting_file = State()
+
+
+class AutoTicketSettings(StatesGroup):
+    waiting_delay = State()
+    waiting_interval = State()
+    waiting_limit = State()
+    waiting_template = State()
 
 
 class OwnerOnlyMiddleware(BaseMiddleware):
@@ -372,8 +380,46 @@ def tickets_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Мои тикеты", callback_data="tickets:list")
     builder.button(text="Новый тикет", callback_data="tickets:new")
+    builder.button(text="Настройки", callback_data="tickets:settings")
     builder.button(text="Назад", callback_data="menu:main")
-    builder.adjust(2, 1)
+    builder.adjust(2, 1, 1)
+    return builder.as_markup()
+
+
+def auto_ticket_settings_menu(settings: dict[str, Any]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    marker = "🟢" if settings["enabled"] else "🔴"
+    scope = "Все заказы" if settings["scope"] == "all" else "Только автовыдача"
+    builder.button(
+        text=f"{marker} Автотикеты",
+        callback_data="tickets:settings:toggle",
+    )
+    builder.button(
+        text=f"Область: {scope}",
+        callback_data="tickets:settings:scope",
+    )
+    builder.button(
+        text=f"Ожидание: {settings['delay_hours']} ч",
+        callback_data="tickets:settings:delay",
+    )
+    builder.button(
+        text=f"Проверка: {settings['check_interval_minutes']} мин",
+        callback_data="tickets:settings:interval",
+    )
+    builder.button(
+        text=f"Лимит: {settings['max_orders_per_ticket']}",
+        callback_data="tickets:settings:limit",
+    )
+    builder.button(text="Текст тикета", callback_data="tickets:settings:template")
+    builder.button(text="Проверить сейчас", callback_data="tickets:settings:check")
+    builder.button(text="Назад", callback_data="menu:tickets")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def auto_ticket_cancel_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отмена", callback_data="tickets:settings")
     return builder.as_markup()
 
 
@@ -735,6 +781,48 @@ def format_system_settings(system_settings: SystemSettingsService) -> str:
         "<b>Проверка:</b> один раз в час\n\n"
         "Здесь можно посмотреть ресурсы сервера, отключить запись логов или очистить их."
     )
+
+
+def format_auto_ticket_settings(auto_tickets: AutoTicketService) -> str:
+    settings = auto_tickets.get_settings()
+    status = "включены" if settings["enabled"] else "выключены"
+    scope = (
+        "все неподтверждённые заказы"
+        if settings["scope"] == "all"
+        else "только заказы автовыдачи FunPay или MoneyBot"
+    )
+    last_check_at = auto_tickets.get_last_check_at()
+    last_check = (
+        time.strftime("%d.%m.%Y %H:%M", time.localtime(last_check_at))
+        if last_check_at
+        else "ещё не выполнялась"
+    )
+    template = html.escape(str(settings["message_template"]))
+    return (
+        "<b>Настройки автотикетов</b>\n\n"
+        f"<b>Статус:</b> {status}\n"
+        f"<b>Область:</b> {scope}\n"
+        f"<b>Без подтверждения:</b> {settings['delay_hours']} ч\n"
+        f"<b>Интервал проверки:</b> {settings['check_interval_minutes']} мин\n"
+        f"<b>Заказов в тикете:</b> до {settings['max_orders_per_ticket']}\n"
+        f"<b>Последняя проверка:</b> {last_check}\n\n"
+        f"<b>Текст:</b>\n<code>{template}</code>\n\n"
+        "Каждый заказ отправляется в Support только один раз."
+    )
+
+
+def format_auto_ticket_result(result: AutoTicketResult) -> str:
+    if result.status == "sent":
+        orders = ", ".join(f"#{order_id}" for order_id in result.order_ids)
+        ticket = f" #{html.escape(result.ticket_id)}" if result.ticket_id else ""
+        return f"<b>Автотикет{ticket} отправлен</b>\nЗаказы: {html.escape(orders)}"
+    if result.status == "empty":
+        return "Подходящих неподтверждённых заказов не найдено."
+    if result.status == "disabled":
+        return "Сначала включите автотикеты."
+    if result.status == "busy":
+        return "Проверка уже выполняется."
+    return "<b>Ошибка автотикета</b>\n" + html.escape(result.error or "неизвестная ошибка")
 
 
 def format_cleanup_result(result: CleanupResult) -> str:
@@ -1699,6 +1787,196 @@ async def callback_tickets(callback: CallbackQuery, state: FSMContext) -> None:
         )
 
 
+@router.callback_query(F.data == "tickets:settings")
+async def callback_auto_ticket_settings(
+    callback: CallbackQuery,
+    state: FSMContext,
+    auto_tickets: AutoTicketService,
+) -> None:
+    await callback.answer()
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            format_auto_ticket_settings(auto_tickets),
+            reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+        )
+
+
+@router.callback_query(F.data == "tickets:settings:toggle")
+async def callback_auto_ticket_toggle(
+    callback: CallbackQuery, auto_tickets: AutoTicketService
+) -> None:
+    enabled = auto_tickets.toggle()
+    await callback.answer("Автотикеты включены" if enabled else "Автотикеты выключены")
+    if callback.message:
+        await callback.message.edit_text(
+            format_auto_ticket_settings(auto_tickets),
+            reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+        )
+
+
+@router.callback_query(F.data == "tickets:settings:scope")
+async def callback_auto_ticket_scope(
+    callback: CallbackQuery, auto_tickets: AutoTicketService
+) -> None:
+    scope = auto_tickets.toggle_scope()
+    await callback.answer(
+        "Все заказы" if scope == "all" else "Только заказы автовыдачи"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            format_auto_ticket_settings(auto_tickets),
+            reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+        )
+
+
+@router.callback_query(F.data == "tickets:settings:delay")
+async def callback_auto_ticket_delay(
+    callback: CallbackQuery, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    await callback.answer()
+    await state.set_state(AutoTicketSettings.waiting_delay)
+    current = auto_tickets.get_settings()["delay_hours"]
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Срок ожидания подтверждения</b>\n\n"
+            f"Сейчас: {current} ч. Отправьте количество часов от 1 до 720.",
+            reply_markup=auto_ticket_cancel_menu(),
+        )
+
+
+@router.message(AutoTicketSettings.waiting_delay, F.text)
+async def receive_auto_ticket_delay(
+    message: Message, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    value = str(message.text or "").strip()
+    if not value.isdigit() or not 1 <= int(value) <= 720:
+        await message.answer("Введите целое число от 1 до 720.")
+        return
+    auto_tickets.set_delay_hours(int(value))
+    await state.clear()
+    await message.answer(
+        format_auto_ticket_settings(auto_tickets),
+        reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+    )
+
+
+@router.callback_query(F.data == "tickets:settings:interval")
+async def callback_auto_ticket_interval(
+    callback: CallbackQuery, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    await callback.answer()
+    await state.set_state(AutoTicketSettings.waiting_interval)
+    current = auto_tickets.get_settings()["check_interval_minutes"]
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Интервал проверки</b>\n\n"
+            f"Сейчас: {current} мин. Отправьте значение от 10 до 1440 минут.",
+            reply_markup=auto_ticket_cancel_menu(),
+        )
+
+
+@router.message(AutoTicketSettings.waiting_interval, F.text)
+async def receive_auto_ticket_interval(
+    message: Message, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    value = str(message.text or "").strip()
+    if not value.isdigit() or not 10 <= int(value) <= 1440:
+        await message.answer("Введите целое число от 10 до 1440.")
+        return
+    auto_tickets.set_interval_minutes(int(value))
+    await state.clear()
+    await message.answer(
+        format_auto_ticket_settings(auto_tickets),
+        reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+    )
+
+
+@router.callback_query(F.data == "tickets:settings:limit")
+async def callback_auto_ticket_limit(
+    callback: CallbackQuery, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    await callback.answer()
+    await state.set_state(AutoTicketSettings.waiting_limit)
+    current = auto_tickets.get_settings()["max_orders_per_ticket"]
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Лимит заказов</b>\n\n"
+            f"Сейчас: {current}. Отправьте число от 1 до 10.",
+            reply_markup=auto_ticket_cancel_menu(),
+        )
+
+
+@router.message(AutoTicketSettings.waiting_limit, F.text)
+async def receive_auto_ticket_limit(
+    message: Message, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    value = str(message.text or "").strip()
+    if not value.isdigit() or not 1 <= int(value) <= 10:
+        await message.answer("Введите целое число от 1 до 10.")
+        return
+    auto_tickets.set_max_orders(int(value))
+    await state.clear()
+    await message.answer(
+        format_auto_ticket_settings(auto_tickets),
+        reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+    )
+
+
+@router.callback_query(F.data == "tickets:settings:template")
+async def callback_auto_ticket_template(
+    callback: CallbackQuery, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    await callback.answer()
+    await state.set_state(AutoTicketSettings.waiting_template)
+    current = html.escape(auto_tickets.get_settings()["message_template"])
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Текст автоматического тикета</b>\n\n"
+            f"Сейчас:\n<code>{current}</code>\n\n"
+            "Отправьте новый текст до 2000 символов. Обязательная переменная: "
+            "<code>{order_ids}</code>. Также доступны <code>{orders_count}</code> "
+            "и <code>{account}</code>.",
+            reply_markup=auto_ticket_cancel_menu(),
+        )
+
+
+@router.message(AutoTicketSettings.waiting_template, F.text)
+async def receive_auto_ticket_template(
+    message: Message, state: FSMContext, auto_tickets: AutoTicketService
+) -> None:
+    template = str(message.text or "").strip()
+    if not template or len(template) > 2000:
+        await message.answer("Текст должен содержать от 1 до 2000 символов.")
+        return
+    if "{order_ids}" not in template:
+        await message.answer("Добавьте обязательную переменную <code>{order_ids}</code>.")
+        return
+    auto_tickets.set_message_template(template)
+    await state.clear()
+    await message.answer(
+        format_auto_ticket_settings(auto_tickets),
+        reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+    )
+
+
+@router.callback_query(F.data == "tickets:settings:check")
+async def callback_auto_ticket_check(
+    callback: CallbackQuery, auto_tickets: AutoTicketService
+) -> None:
+    await callback.answer("Проверяю заказы...")
+    if not callback.message:
+        return
+    await callback.message.edit_text("Проверяю неподтверждённые заказы...")
+    result = await asyncio.to_thread(auto_tickets.run_check)
+    await callback.message.edit_text(
+        format_auto_ticket_settings(auto_tickets)
+        + "\n\n"
+        + format_auto_ticket_result(result),
+        reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+    )
+
+
 @router.callback_query(F.data == "tickets:list")
 async def callback_ticket_list(
     callback: CallbackQuery, ticket_client: TicketClient
@@ -2027,9 +2305,10 @@ async def run_bot(config: BotConfig) -> None:
     system_settings.start_cleanup_worker()
     dispatcher["system_settings"] = system_settings
     dispatcher["funpay"] = FunPayService(config.golden_key)
-    dispatcher["ticket_client"] = TicketClient(
+    ticket_client = TicketClient(
         config.golden_key, config.support_phpsessid
     )
+    dispatcher["ticket_client"] = ticket_client
     plugin_manager = PluginManager(config.bot_token, config.owner_id, config.golden_key)
     await asyncio.to_thread(plugin_manager.initialize)
     dispatcher["plugin_manager"] = plugin_manager
@@ -2037,6 +2316,10 @@ async def run_bot(config: BotConfig) -> None:
     dispatcher["automation"] = automation
     auto_delivery = AutoDeliveryService(plugin_manager.account)
     dispatcher["auto_delivery"] = auto_delivery
+    auto_tickets = AutoTicketService(
+        plugin_manager.account, ticket_client, auto_delivery
+    )
+    dispatcher["auto_tickets"] = auto_tickets
 
     event_loop = asyncio.get_running_loop()
 
@@ -2075,10 +2358,26 @@ async def run_bot(config: BotConfig) -> None:
 
         future.add_done_callback(log_delivery_result)
 
+    def notify_auto_ticket(result: AutoTicketResult) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(config.owner_id, format_auto_ticket_result(result)),
+            event_loop,
+        )
+
+        def log_auto_ticket_result(notification: Any) -> None:
+            try:
+                notification.result()
+            except Exception:
+                logger.exception("Не удалось отправить результат автотикета в Telegram")
+
+        future.add_done_callback(log_auto_ticket_result)
+
     plugin_manager.add_funpay_message_observer(automation.handle_event)
     plugin_manager.add_funpay_message_observer(notify_funpay_message)
     plugin_manager.add_funpay_order_observer(handle_auto_delivery)
     plugin_manager.activate_runner()
+    auto_tickets.set_result_callback(notify_auto_ticket)
+    auto_tickets.start()
 
     await configure_commands(bot, config.owner_id, plugin_manager)
     me = await bot.get_me()

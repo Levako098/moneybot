@@ -136,6 +136,17 @@ class AutoDeliveryService:
                 self._save()
             return removed
 
+    def get_delivered_order_ids(self) -> set[str]:
+        with self._lock:
+            return {
+                str(item.get("order_id") or "").upper()
+                for item in self._data["delivered_orders"]
+                if isinstance(item, dict) and item.get("order_id")
+            }
+
+    def was_delivered(self, order_id: str) -> bool:
+        return str(order_id).lstrip("#").upper() in self.get_delivered_order_ids()
+
     def handle_event(self, event: Any) -> DeliveryResult | None:
         if type(event).__name__ != "NewOrderEvent" or self.account is None:
             return None
@@ -196,6 +207,7 @@ class AutoDeliveryService:
                         "order_id": order_id,
                         "lot_id": str(rule["lot_id"]),
                         "buyer_username": buyer_username,
+                        "source": "bot",
                         "delivered_at": int(time.time()),
                     }
                 )
