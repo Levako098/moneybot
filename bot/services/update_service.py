@@ -247,15 +247,26 @@ class UpdateService:
     @staticmethod
     def schedule_restart() -> None:
         if os.name == "nt":
-            command = f'timeout /t 3 /nobreak >nul & call "{ROOT / "start.cmd"}"'
+            root = repr(str(ROOT))
+            restart_code = (
+                "import subprocess,sys,time; "
+                "time.sleep(3); "
+                f"subprocess.Popen([sys.executable, '-m', 'bot.main'], cwd={root}, "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL, "
+                "creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | "
+                "subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW, "
+                "close_fds=True)"
+            )
             subprocess.Popen(
-                [os.environ.get("COMSPEC", "cmd.exe"), "/c", command],
+                [sys.executable, "-c", restart_code],
                 cwd=ROOT,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=(
                     subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NO_WINDOW
                 ),
                 close_fds=True,
             )
