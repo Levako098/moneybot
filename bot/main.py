@@ -5,6 +5,7 @@ import csv
 import html
 import io
 import logging
+import os
 import platform
 import re
 import sys
@@ -34,6 +35,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import BotConfig, ConfigError, load_config
 from bot.funpay_service import FunPayService, FunPayServiceError, ProfileInfo
+from bot.version import __version__
 from bot.services.auto_delivery import (
     DELIVERY_VARIABLES,
     AutoDeliveryService,
@@ -58,6 +60,12 @@ from bot.services.system_settings import (
     ResourceWarning,
     SystemSettingsService,
     TemporaryCleanupResult,
+)
+from bot.services.update_service import (
+    ReleaseInfo,
+    UpdateCheckResult,
+    UpdateInstallResult,
+    UpdateService,
 )
 
 
@@ -348,6 +356,15 @@ def resource_warning_menu() -> InlineKeyboardMarkup:
         callback_data="system:resources:cleanup",
     )
     builder.button(text="Проверить ресурсы", callback_data="settings:system:resources")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def update_menu(release: ReleaseInfo) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Обновить", callback_data="update:install")
+    if release.url:
+        builder.button(text="Открыть GitHub", url=release.url)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -924,6 +941,52 @@ def format_resource_warning(warning: ResourceWarning) -> str:
     )
 
 
+def format_update_release(release: ReleaseInfo, current_version: str) -> str:
+    notes = html.escape(release.notes[:2200]) if release.notes else "Описание релиза отсутствует."
+    return (
+        f"<b>Вышло обновление MoneyBot {html.escape(release.version)}</b>\n\n"
+        f"Текущая версия: <code>{html.escape(current_version)}</code>\n"
+        f"Новая версия: <code>{html.escape(release.version)}</code>\n"
+        f"<b>{html.escape(release.name)}</b>\n\n"
+        f"{notes}"
+    )
+
+
+def format_update_check(result: UpdateCheckResult) -> str:
+    if result.error:
+        return "<b>Не удалось проверить обновления</b>\n" + html.escape(result.error)
+    if not result.update_available or result.latest is None:
+        return (
+            "<b>Обновлений нет</b>\n"
+            f"Установлена актуальная версия <code>{html.escape(result.current_version)}</code>."
+        )
+    return format_update_release(result.latest, result.current_version)
+
+
+def format_update_install(result: UpdateInstallResult) -> str:
+    if result.status == "busy":
+        return "Обновление уже выполняется."
+    if result.status == "dirty":
+        return (
+            "<b>Обновление остановлено</b>\n"
+            f"{html.escape(result.error)}. Сначала сохраните или отмените локальные изменения."
+        )
+    if result.status == "installed":
+        return (
+            "<b>Обновление установлено</b>\n"
+            f"Версия: <code>{html.escape(result.version or 'новая')}</code>\n"
+            "Бот перезапускается..."
+        )
+    if result.status == "current":
+        return (
+            "<b>Обновлений нет</b>\n"
+            f"Установлена актуальная версия <code>{html.escape(result.version)}</code>."
+        )
+    return "<b>Не удалось установить обновление</b>\n" + html.escape(
+        result.error or "неизвестная ошибка"
+    )
+
+
 def format_raise_lots_result(result: RaiseLotsResult) -> str:
     if result.status == "busy":
         return "Поднятие лотов уже выполняется."
@@ -1069,6 +1132,14 @@ async def command_system(message: Message) -> None:
     await wait.edit_text(text)
 
 
+@router.message(Command("update"))
+async def command_update(message: Message, update_service: UpdateService) -> None:
+    wait = await message.answer("Проверяю обновления MoneyBot...")
+    result = await asyncio.to_thread(update_service.check)
+    markup = update_menu(result.latest) if result.update_available and result.latest else None
+    await wait.edit_text(format_update_check(result), reply_markup=markup)
+
+
 @router.message(Command("log"))
 async def command_log(
     message: Message, system_settings: SystemSettingsService
@@ -1095,6 +1166,36 @@ async def command_log(
         ),
     )
     await wait.delete()
+
+
+@router.callback_query(F.data == "update:install")
+async def callback_update_install(
+    callback: CallbackQuery, update_service: UpdateService
+) -> None:
+    await callback.answer("Устанавливаю обновление...")
+    if not callback.message:
+        return
+    await callback.message.edit_text(
+        "<b>Устанавливаю обновление</b>\n"
+        "Проверяю Git, загружаю код и зависимости..."
+    )
+    result = await asyncio.to_thread(update_service.install)
+    await callback.message.edit_text(format_update_install(result))
+    if result.status != "installed":
+        return
+    await asyncio.sleep(1)
+    try:
+        update_service.schedule_restart()
+    except Exception as error:
+        logger.exception("Не удалось запланировать перезапуск после обновления")
+        await callback.message.edit_text(
+            "<b>Обновление установлено, но автоперезапуск не выполнен</b>\n"
+            + html.escape(str(error).splitlines()[0][:300])
+            + "\nПерезапустите службу MoneyBot вручную."
+        )
+        return
+    await asyncio.sleep(1)
+    os._exit(0)
 
 
 @router.callback_query(F.data.startswith("fp:reply:"))
@@ -2499,6 +2600,7 @@ async def configure_commands(
         "profile": "Аккаунт FunPay",
         "tickets": "Тикеты Support",
         "system": "Ресурсы системы",
+        "update": "Проверить обновления",
         "log": "Скачать логи",
     }
     for plugin in plugin_manager.plugins.values():
@@ -2544,6 +2646,8 @@ async def run_bot(config: BotConfig) -> None:
     system_settings.apply_logging()
     system_settings.start_cleanup_worker()
     dispatcher["system_settings"] = system_settings
+    update_service = UpdateService()
+    dispatcher["update_service"] = update_service
     dispatcher["funpay"] = FunPayService(config.golden_key)
     ticket_client = TicketClient(
         config.golden_key, config.support_phpsessid
@@ -2562,6 +2666,25 @@ async def run_bot(config: BotConfig) -> None:
     dispatcher["auto_tickets"] = auto_tickets
 
     event_loop = asyncio.get_running_loop()
+
+    def notify_update_release(release: ReleaseInfo) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(
+                config.owner_id,
+                format_update_release(release, __version__),
+                reply_markup=update_menu(release),
+            ),
+            event_loop,
+        )
+
+        def log_update_notification_result(notification: Any) -> None:
+            try:
+                notification.result()
+                update_service.mark_notified(release)
+            except Exception:
+                logger.exception("Не удалось отправить уведомление об обновлении")
+
+        future.add_done_callback(log_update_notification_result)
 
     def notify_resource_warning(warning: ResourceWarning) -> None:
         future = asyncio.run_coroutine_threadsafe(
@@ -2652,6 +2775,7 @@ async def run_bot(config: BotConfig) -> None:
     await configure_commands(bot, config.owner_id, plugin_manager)
     me = await bot.get_me()
     logger.info("Aiogram-бот @%s запущен", me.username)
+    update_service.start(notify_update_release)
     for pending in auto_tickets.list_pending():
         pending_result = AutoTicketResult(
             "pending",

@@ -31,12 +31,9 @@ if errorlevel 1 (
 
 "bot\.venv\Scripts\python.exe" -m bot.main
 set "exit_code=%errorlevel%"
-echo.
-pause
 exit /b %exit_code%
 
 :error
 echo.
 echo Failed to prepare the bot.
-pause
 exit /b 1
