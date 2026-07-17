@@ -281,6 +281,33 @@ def _lot_id(order: Any) -> str:
     return ""
 
 
+def _resolve_lot_title(account: Any, lot_id: str) -> str:
+    errors = []
+    try:
+        fields = account.get_lot_fields(int(lot_id))
+        title = str(
+            getattr(fields, "title_ru", None)
+            or getattr(fields, "title_en", None)
+            or ""
+        ).strip()
+        if title:
+            return title
+    except Exception as error:
+        errors.append(str(error).splitlines()[0][:180])
+
+    try:
+        profile = account.get_user(account.id)
+        for lot in profile.get_lots():
+            if str(getattr(lot, "id", "")) == str(lot_id):
+                title = str(getattr(lot, "title", None) or getattr(lot, "description", None) or "").strip()
+                if title:
+                    return title
+    except Exception as error:
+        errors.append(str(error).splitlines()[0][:180])
+    reason = errors[0] if errors else "лот не найден в активных лотах профиля"
+    raise RuntimeError(reason)
+
+
 def _send_accounts(
     cardinal: Any,
     order: Any,
@@ -457,12 +484,7 @@ def _on_callback(cardinal: Any, call: Any) -> None:
             cardinal.telegram.bot.send_message(call.message.chat.id, "Сначала укажите lot ID.")
         else:
             try:
-                fields = cardinal.account.get_lot_fields(int(data["lot_id"]))
-                title = str(
-                    getattr(fields, "title_ru", None)
-                    or getattr(fields, "title_en", None)
-                    or "Без названия"
-                ).strip()
+                title = _resolve_lot_title(cardinal.account, data["lot_id"])
                 with LOCK:
                     data = _load()
                     data["lot_title"] = title

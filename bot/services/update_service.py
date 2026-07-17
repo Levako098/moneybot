@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import io
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -176,27 +180,24 @@ class UpdateService:
         if not self._install_lock.acquire(blocking=False):
             return UpdateInstallResult("busy")
         try:
-            if not (ROOT / ".git").is_dir():
-                return UpdateInstallResult(
-                    "error", error="Обновление доступно только для Git-установки"
+            git_install = (ROOT / ".git").is_dir()
+            if git_install:
+                status = self._run(
+                    ["git", "status", "--porcelain", "--untracked-files=no"]
                 )
+                if status.returncode != 0:
+                    return UpdateInstallResult("error", error=self._command_error(status))
+                if status.stdout.strip():
+                    return UpdateInstallResult(
+                        "dirty",
+                        error="Есть локальные изменения в отслеживаемых файлах",
+                    )
 
-            status = self._run(
-                ["git", "status", "--porcelain", "--untracked-files=no"]
-            )
-            if status.returncode != 0:
-                return UpdateInstallResult("error", error=self._command_error(status))
-            if status.stdout.strip():
-                return UpdateInstallResult(
-                    "dirty",
-                    error="Есть локальные изменения в отслеживаемых файлах",
-                )
-
-            branch = self._run(["git", "branch", "--show-current"])
-            if branch.returncode != 0 or branch.stdout.strip() != "main":
-                return UpdateInstallResult(
-                    "error", error="Для автообновления нужна ветка main"
-                )
+                branch = self._run(["git", "branch", "--show-current"])
+                if branch.returncode != 0 or branch.stdout.strip() != "main":
+                    return UpdateInstallResult(
+                        "error", error="Для автообновления нужна ветка main"
+                    )
 
             check = self.check()
             if check.error:
@@ -204,13 +205,18 @@ class UpdateService:
             if not check.update_available or check.latest is None:
                 return UpdateInstallResult("current", version=__version__)
 
-            fetch = self._run(["git", "fetch", "--tags", "origin"])
-            if fetch.returncode != 0:
-                return UpdateInstallResult("error", error=self._command_error(fetch))
+            if git_install:
+                fetch = self._run(["git", "fetch", "--tags", "origin"])
+                if fetch.returncode != 0:
+                    return UpdateInstallResult("error", error=self._command_error(fetch))
 
-            merge = self._run(["git", "merge", "--ff-only", check.latest.tag])
-            if merge.returncode != 0:
-                return UpdateInstallResult("error", error=self._command_error(merge))
+                merge = self._run(["git", "merge", "--ff-only", check.latest.tag])
+                if merge.returncode != 0:
+                    return UpdateInstallResult("error", error=self._command_error(merge))
+            else:
+                archive_error = self._install_archive(check.latest)
+                if archive_error:
+                    return UpdateInstallResult("error", error=archive_error)
 
             dependencies = self._run(
                 [sys.executable, "-m", "pip", "install", "-r", "bot/requirements.txt"],
@@ -231,6 +237,63 @@ class UpdateService:
             )
         finally:
             self._install_lock.release()
+
+    @staticmethod
+    def _archive_url(release: ReleaseInfo) -> str:
+        return (
+            "https://github.com/Levako098/moneybot/archive/refs/tags/"
+            f"{release.tag}.zip"
+        )
+
+    @classmethod
+    def _install_archive(cls, release: ReleaseInfo) -> str:
+        """Update a ZIP installation while preserving local runtime files."""
+        try:
+            response = requests.get(
+                cls._archive_url(release),
+                headers={"User-Agent": f"MoneyBot/{__version__}"},
+                timeout=120,
+            )
+            response.raise_for_status()
+            with tempfile.TemporaryDirectory(prefix=".moneybot-update-", dir=ROOT.parent) as temp_dir:
+                temp_root = Path(temp_dir).resolve()
+                with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                    for member in archive.infolist():
+                        target = (temp_root / member.filename).resolve()
+                        target.relative_to(temp_root)
+                    archive.extractall(temp_root)
+
+                roots = [path for path in temp_root.iterdir() if path.is_dir()]
+                if len(roots) != 1:
+                    return "Архив обновления имеет неверную структуру"
+                source = roots[0]
+
+                for item in source.iterdir():
+                    if item.name in {"config.json", ".git", "plugins", "storage", "data"}:
+                        continue
+                    destination = ROOT / item.name
+                    if item.name == "bot":
+                        cls._copy_bot_tree(item, destination)
+                    elif item.is_dir():
+                        shutil.copytree(item, destination, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, destination)
+            return ""
+        except (OSError, requests.RequestException, zipfile.BadZipFile, ValueError) as error:
+            reason = str(error).splitlines()[0].strip()
+            return reason[:300] if reason else type(error).__name__
+
+    @staticmethod
+    def _copy_bot_tree(source: Path, destination: Path) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in source.iterdir():
+            if item.name in {"data", ".venv", "__pycache__"}:
+                continue
+            target = destination / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
 
     @staticmethod
     def _command_error(result: subprocess.CompletedProcess[str]) -> str:

@@ -123,6 +123,9 @@ class AutomationSettings(StatesGroup):
     waiting_message_template = State()
     waiting_message_cooldown = State()
     waiting_review_template = State()
+    waiting_command_name = State()
+    waiting_command_response = State()
+    waiting_command_notification = State()
 
 
 class AutoDeliverySettings(StatesGroup):
@@ -299,6 +302,7 @@ def message_settings_menu(enabled: bool) -> InlineKeyboardMarkup:
     )
     builder.button(text="Изменить шаблон", callback_data="settings:messages:template")
     builder.button(text="Изменить КД", callback_data="settings:messages:cooldown")
+    builder.button(text="Команды", callback_data="settings:messages:commands")
     builder.button(text="Назад", callback_data="menu:settings")
     builder.adjust(1)
     return builder.as_markup()
@@ -812,10 +816,12 @@ def format_message_settings(automation: AutomationService) -> str:
         f"<code>{{{name}}}</code> — {variables[name]}" for name in MESSAGE_VARIABLES
     )
     template = html.escape(str(settings["template"]))
+    command_count = len(settings.get("commands", {}))
     return (
         "<b>Ответ на сообщения</b>\n\n"
         f"<b>Статус:</b> {status}\n"
         f"<b>КД для каждого чата:</b> {format_cooldown(int(settings['cooldown_seconds']))}\n\n"
+        f"<b>Команд:</b> {command_count}\n\n"
         f"<b>Шаблон:</b>\n<code>{template}</code>\n\n"
         f"<b>Переменные:</b>\n{variable_lines}\n\n"
         "Автоответ отправляется только на обычные входящие сообщения покупателей."
@@ -2214,6 +2220,134 @@ async def receive_message_cooldown(
     )
 
 
+def format_command_settings(automation: AutomationService) -> str:
+    commands = automation.get_commands()
+    lines = ["<b>Команды FunPay</b>", ""]
+    if not commands:
+        lines.append("Команды ещё не созданы.")
+    for command, data in commands.items():
+        lines.append(f"<b>{html.escape(command)}</b> → <code>{html.escape(data['response'][:120])}</code>")
+    return "\n".join(lines)
+
+
+def command_settings_menu(automation: AutomationService) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    commands = list(automation.get_commands())
+    builder.button(text="Добавить команду", callback_data="settings:messages:commands:add")
+    for index, command in enumerate(commands):
+        builder.button(
+            text=f"Удалить {command}",
+            callback_data=f"settings:messages:commands:delete:{index}",
+        )
+    builder.button(text="Назад", callback_data="settings:messages")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == "settings:messages:commands")
+async def callback_message_commands(
+    callback: CallbackQuery, state: FSMContext, automation: AutomationService
+) -> None:
+    await callback.answer()
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            format_command_settings(automation),
+            reply_markup=command_settings_menu(automation),
+        )
+
+
+@router.callback_query(F.data == "settings:messages:commands:add")
+async def callback_message_command_add(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    await callback.answer()
+    await state.set_state(AutomationSettings.waiting_command_name)
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Новая команда</b>\n\n"
+            "Отправьте команду, например <code>!вызов</code>.\n"
+            "Допустимы буквы, цифры и символ <code>_</code>.",
+            reply_markup=settings_cancel_menu("messages:commands"),
+        )
+
+
+@router.message(AutomationSettings.waiting_command_name, F.text)
+async def receive_message_command_name(
+    message: Message, state: FSMContext
+) -> None:
+    command = str(message.text or "").strip().lower()
+    if not re.fullmatch(r"![a-zа-яё0-9_]{1,32}", command, re.IGNORECASE):
+        await message.answer("Некорректная команда. Пример: <code>!вызов</code>.")
+        return
+    await state.update_data(command_name=command)
+    await state.set_state(AutomationSettings.waiting_command_response)
+    await message.answer(
+        "Отправьте текст, который бот напишет покупателю в FunPay.\n"
+        "Можно использовать <code>{username}</code>, <code>{message}</code>, <code>{command}</code>, <code>{account}</code> и <code>{chat_id}</code>."
+    )
+
+
+@router.message(AutomationSettings.waiting_command_response, F.text)
+async def receive_message_command_response(
+    message: Message, state: FSMContext
+) -> None:
+    response = str(message.text or "").strip()
+    if not response or len(response) > 4000:
+        await message.answer("Ответ должен быть непустым и не длиннее 4000 символов.")
+        return
+    await state.update_data(command_response=response)
+    await state.set_state(AutomationSettings.waiting_command_notification)
+    await message.answer(
+        "Отправьте текст уведомления владельцу в Telegram.\n"
+        "Можно использовать те же переменные."
+    )
+
+
+@router.message(AutomationSettings.waiting_command_notification, F.text)
+async def receive_message_command_notification(
+    message: Message, state: FSMContext, automation: AutomationService
+) -> None:
+    notification = str(message.text or "").strip()
+    if not notification or len(notification) > 4000:
+        await message.answer("Уведомление должно быть непустым и не длиннее 4000 символов.")
+        return
+    data = await state.get_data()
+    try:
+        automation.set_command(
+            str(data.get("command_name") or ""),
+            str(data.get("command_response") or ""),
+            notification,
+        )
+    except ValueError as error:
+        await state.clear()
+        await message.answer(f"Команда не сохранена: {html.escape(str(error))}")
+        return
+    await state.clear()
+    await message.answer(
+        format_command_settings(automation),
+        reply_markup=command_settings_menu(automation),
+    )
+
+
+@router.callback_query(F.data.startswith("settings:messages:commands:delete:"))
+async def callback_message_command_delete(
+    callback: CallbackQuery, automation: AutomationService
+) -> None:
+    index_text = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
+    commands = list(automation.get_commands())
+    if not index_text.isdigit() or int(index_text) >= len(commands):
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    automation.delete_command(commands[int(index_text)])
+    await callback.answer("Команда удалена")
+    if callback.message:
+        await callback.message.edit_text(
+            format_command_settings(automation),
+            reply_markup=command_settings_menu(automation),
+        )
+
+
 @router.callback_query(F.data == "settings:reviews")
 async def callback_review_settings(
     callback: CallbackQuery, state: FSMContext, automation: AutomationService
@@ -2948,6 +3082,28 @@ async def run_bot(config: BotConfig) -> None:
         future.add_done_callback(log_resource_warning_result)
 
     def notify_funpay_message(event: Any) -> None:
+        command_result = automation.handle_command(event.message)
+        if command_result is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                bot.send_message(
+                    config.owner_id,
+                    "👤 <b>Команда FunPay</b>\n"
+                    f"Покупатель: {html.escape(command_result['username'])}\n"
+                    f"Команда: <code>{html.escape(command_result['command'])}</code>\n\n"
+                    + html.escape(command_result["notification"]),
+                ),
+                event_loop,
+            )
+            def log_command_notification_result(result: Any) -> None:
+                try:
+                    result.result()
+                except Exception:
+                    logger.exception(
+                        "Не удалось отправить уведомление о команде FunPay в Telegram"
+                    )
+
+            future.add_done_callback(log_command_notification_result)
+            return
         if not automation.should_notify(event.message):
             return
         account_id = plugin_manager.account.id if plugin_manager.account else None

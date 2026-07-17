@@ -21,6 +21,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "enabled": False,
         "cooldown_seconds": 300,
         "template": "Здравствуйте, {username}! Спасибо за сообщение.",
+        "commands": {},
     },
     "reviews": {
         "enabled": False,
@@ -43,7 +44,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
 }
 
-MESSAGE_VARIABLES = ("username", "chat_name", "message", "account", "chat_id")
+MESSAGE_VARIABLES = ("username", "chat_name", "message", "command", "account", "chat_id")
 REVIEW_VARIABLES = (
     "username",
     "order_id",
@@ -82,6 +83,18 @@ def _normalized_settings(data: Any) -> dict[str, Any]:
             result["messages"]["enabled"] = messages["enabled"]
         if isinstance(messages.get("template"), str) and messages["template"].strip():
             result["messages"]["template"] = messages["template"].strip()
+        if isinstance(messages.get("commands"), dict):
+            for command, command_data in messages["commands"].items():
+                if not isinstance(command_data, dict):
+                    continue
+                command = str(command).strip().lower()
+                response = str(command_data.get("response") or "").strip()
+                notification = str(command_data.get("notification") or "").strip()
+                if command.startswith("!") and response and notification:
+                    result["messages"]["commands"][command] = {
+                        "response": response,
+                        "notification": notification,
+                    }
         cooldown = messages.get("cooldown_seconds")
         if isinstance(cooldown, int) and not isinstance(cooldown, bool):
             result["messages"]["cooldown_seconds"] = min(max(cooldown, 0), 86400)
@@ -158,6 +171,76 @@ class AutomationService:
             self._settings["messages"]["cooldown_seconds"] = seconds
             self._save()
 
+    def get_commands(self) -> dict[str, dict[str, str]]:
+        with self._lock:
+            return copy.deepcopy(self._settings["messages"].get("commands", {}))
+
+    def set_command(self, command: str, response: str, notification: str) -> None:
+        command = command.strip().lower()
+        if not re.fullmatch(r"![a-zа-яё0-9_]{1,32}", command, re.IGNORECASE):
+            raise ValueError("Команда должна начинаться с ! и содержать только буквы, цифры или _")
+        if not response.strip() or not notification.strip():
+            raise ValueError("Ответ покупателю и уведомление владельцу обязательны")
+        with self._lock:
+            self._settings["messages"].setdefault("commands", {})[command] = {
+                "response": response.strip(),
+                "notification": notification.strip(),
+            }
+            self._save()
+
+    def delete_command(self, command: str) -> bool:
+        with self._lock:
+            removed = self._settings["messages"].setdefault("commands", {}).pop(command, None)
+            if removed is not None:
+                self._save()
+            return removed is not None
+
+    def is_command_message(self, message: Any) -> bool:
+        text = str(getattr(message, "text", None) or "").strip()
+        command = text.split(maxsplit=1)[0].lower() if text else ""
+        with self._lock:
+            return command in self._settings["messages"].get("commands", {})
+
+    def handle_command(self, message: Any) -> dict[str, str] | None:
+        if self.account is None or not self.is_command_message(message):
+            return None
+        if (
+            getattr(message, "author_id", 0) in {0, getattr(self.account, "id", None)}
+            or bool(getattr(message, "by_bot", False))
+        ):
+            return None
+        text = str(getattr(message, "text", None) or "").strip()
+        command = text.split(maxsplit=1)[0].lower()
+        with self._lock:
+            settings = copy.deepcopy(self._settings["messages"]["commands"].get(command))
+        if not settings:
+            return None
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        username = getattr(message, "author", None) or getattr(message, "chat_name", None) or "покупатель"
+        context = {
+            "username": username,
+            "chat_name": getattr(message, "chat_name", None) or "",
+            "message": text,
+            "command": command,
+            "account": getattr(self.account, "username", None) or "",
+            "chat_id": chat_id,
+        }
+        response = render_template(settings["response"], context)[:4000]
+        notification = render_template(settings["notification"], context)[:4000]
+        if not response or not chat_id:
+            return None
+        try:
+            self.account.send_message(chat_id, response)
+        except Exception:
+            logger.exception("Не удалось отправить ответ команды в чат FunPay %s", chat_id)
+            return None
+        return {
+            "command": command,
+            "username": str(username),
+            "response": response,
+            "notification": notification,
+        }
+
     def toggle_reviews(self) -> bool:
         with self._lock:
             enabled = not self._settings["reviews"]["enabled"]
@@ -223,6 +306,8 @@ class AutomationService:
         if message_type in {"NEW_FEEDBACK", "FEEDBACK_CHANGED"}:
             return self._handle_review(message)
         if message_type in {"", "NON_SYSTEM"}:
+            if self.is_command_message(message):
+                return None
             return self._handle_message(message)
         return None
 
