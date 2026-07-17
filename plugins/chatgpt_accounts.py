@@ -14,7 +14,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 NAME = "ChatGPT Accounts Auto Delivery"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = (
     "Автоматически выдаёт аккаунты ChatGPT из очереди после оплаты заказа "
     "по выбранному lot ID. Аккаунты можно загрузить документом или текстом."
@@ -34,6 +34,8 @@ def _default() -> dict[str, Any]:
     return {
         "enabled": True,
         "lot_id": "",
+        "lot_title": "",
+        "template": "Спасибо за покупку!\n\nАккаунт ChatGPT:\n{account}\n\nЗаказ: #{order_id}",
         "accounts": [],
         "delivered_orders": [],
     }
@@ -49,6 +51,8 @@ def _load() -> dict[str, Any]:
         data.update(raw)
     data["enabled"] = bool(data.get("enabled", True))
     data["lot_id"] = str(data.get("lot_id") or "").strip()
+    data["lot_title"] = str(data.get("lot_title") or "").strip()
+    data["template"] = str(data.get("template") or _default()["template"]).strip()
     data["accounts"] = [str(item).strip() for item in data.get("accounts", []) if str(item).strip()]
     data["delivered_orders"] = [str(item).upper() for item in data.get("delivered_orders", [])]
     return data
@@ -63,8 +67,12 @@ def _save(data: dict[str, Any]) -> None:
 
 def _menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
     keyboard = InlineKeyboardMarkup()
-    keyboard.row(InlineKeyboardButton("Указать lot ID", callback_data=f"47:{UUID}:set_lot"))
+    keyboard.row(
+        InlineKeyboardButton("Указать lot ID", callback_data=f"47:{UUID}:set_lot"),
+        InlineKeyboardButton("Проверить лот", callback_data=f"47:{UUID}:check_lot"),
+    )
     keyboard.row(InlineKeyboardButton("Загрузить аккаунты", callback_data=f"47:{UUID}:upload"))
+    keyboard.row(InlineKeyboardButton("Шаблон выдачи", callback_data=f"47:{UUID}:template"))
     keyboard.row(
         InlineKeyboardButton(
             "🔴 Автовыдача выключена" if not data["enabled"] else "🟢 Автовыдача включена",
@@ -82,9 +90,11 @@ def _menu_text(data: dict[str, Any]) -> str:
     return (
         "<b>ChatGPT Accounts Auto Delivery</b>\n\n"
         f"Lot ID: <code>{html.escape(lot_id)}</code>\n"
+        f"Название: <b>{html.escape(data['lot_title'] or 'не проверено')}</b>\n"
         f"Аккаунтов в очереди: <b>{len(data['accounts'])}</b>\n"
         f"Автовыдача: <b>{status}</b>\n\n"
-        "Один аккаунт = одна непустая строка файла."
+        "Один аккаунт = одна непустая строка файла.\n"
+        f"Шаблон: <code>{html.escape(data['template'][:180])}</code>"
     )
 
 
@@ -119,6 +129,50 @@ def _parse_accounts(text: str) -> list[str]:
     return [line.strip() for line in str(text).splitlines() if line.strip()]
 
 
+TEMPLATE_HELP = (
+    "Переменные шаблона:\n"
+    "{account} — выданный аккаунт\n"
+    "{username} / {buyer} — покупатель\n"
+    "{order_id} — ID заказа\n"
+    "{lot_id} — ID лота\n"
+    "{amount} — количество аккаунтов\n"
+    "{position} — номер аккаунта в заказе\n"
+    "{total} — всего аккаунтов в заказе\n"
+    "{lot} — название лота"
+)
+
+
+class _TemplateValues(dict[str, Any]):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _format_account(
+    template: str,
+    account: str,
+    order: Any,
+    lot_id: str,
+    amount: int,
+    position: int,
+) -> str:
+    buyer = str(getattr(order, "buyer_username", "") or "")
+    values = _TemplateValues(
+        account=account,
+        username=buyer,
+        buyer=buyer,
+        order_id=str(getattr(order, "id", "") or ""),
+        lot_id=lot_id,
+        amount=amount,
+        position=position,
+        total=amount,
+        lot=str(getattr(order, "title", None) or getattr(order, "short_description", None) or ""),
+    )
+    try:
+        return template.format_map(values).strip()
+    except (KeyError, ValueError, IndexError):
+        return template.replace("{account}", account).strip()
+
+
 def _lot_id(order: Any) -> str:
     direct = getattr(order, "lot_id", None) or getattr(order, "offer_id", None)
     if direct:
@@ -135,14 +189,27 @@ def _lot_id(order: Any) -> str:
     return ""
 
 
-def _send_accounts(cardinal: Any, order: Any, shortcut: Any, accounts: list[str]) -> None:
+def _send_accounts(
+    cardinal: Any,
+    order: Any,
+    shortcut: Any,
+    accounts: list[str],
+    template: str,
+    lot_id: str,
+) -> None:
     buyer = str(getattr(order, "buyer_username", "") or getattr(shortcut, "buyer_username", ""))
     if not buyer:
         raise RuntimeError("не удалось определить покупателя")
     chat = cardinal.account.get_chat_by_name(buyer, make_request=True)
     if chat is None:
         raise RuntimeError("чат покупателя не найден")
-    payload = "Спасибо за покупку!\n\nВаши аккаунты ChatGPT:\n\n" + "\n\n".join(accounts)
+    amount = len(accounts)
+    payload = "\n\n".join(
+        _format_account(template, account, order, lot_id, amount, index)
+        for index, account in enumerate(accounts, start=1)
+    )
+    if not payload:
+        raise RuntimeError("шаблон выдачи сформировал пустое сообщение")
     cardinal.account.send_message(chat.id, payload[:4000], chat_name=buyer)
 
 
@@ -181,7 +248,7 @@ def _on_order(cardinal: Any, event: Any) -> None:
             selected = data["accounts"][:amount]
             del data["accounts"][:amount]
             _save(data)
-        _send_accounts(cardinal, order, shortcut, selected)
+        _send_accounts(cardinal, order, shortcut, selected, data["template"], data["lot_id"])
         with LOCK:
             data = _load()
             data["delivered_orders"] = (data["delivered_orders"] + [order_id])[-1000:]
@@ -240,6 +307,20 @@ def _on_message(cardinal: Any, message: Any) -> None:
         cardinal.telegram.clear_state(message.chat.id, message.from_user.id)
         cardinal.telegram.bot.send_message(message.chat.id, f"Добавлено аккаунтов: {len(accounts)}")
         _show_settings(cardinal, message.chat.id)
+    elif mode == "cg_template":
+        template = str(getattr(message, "text", "") or "").strip()
+        if not template:
+            cardinal.telegram.bot.send_message(message.chat.id, "Шаблон не должен быть пустым.")
+            return
+        if len(template) > 3500:
+            cardinal.telegram.bot.send_message(message.chat.id, "Шаблон слишком длинный: максимум 3500 символов.")
+            return
+        with LOCK:
+            data = _load()
+            data["template"] = template
+            _save(data)
+        cardinal.telegram.clear_state(message.chat.id, message.from_user.id)
+        _show_settings(cardinal, message.chat.id)
 
 
 def _on_callback(cardinal: Any, call: Any) -> None:
@@ -251,8 +332,40 @@ def _on_callback(cardinal: Any, call: Any) -> None:
         _show_settings(cardinal, call.message.chat.id, call.message.id)
     elif action == "set_lot":
         _prompt(cardinal, call, "cg_lot", "Отправьте lot ID числом одним сообщением.")
+    elif action == "check_lot":
+        with LOCK:
+            data = _load()
+        if not data["lot_id"]:
+            cardinal.telegram.bot.send_message(call.message.chat.id, "Сначала укажите lot ID.")
+        else:
+            try:
+                fields = cardinal.account.get_lot_fields(int(data["lot_id"]))
+                title = str(
+                    getattr(fields, "title_ru", None)
+                    or getattr(fields, "title_en", None)
+                    or "Без названия"
+                ).strip()
+                with LOCK:
+                    data = _load()
+                    data["lot_title"] = title
+                    _save(data)
+            except Exception as error:
+                cardinal.telegram.bot.send_message(
+                    call.message.chat.id,
+                    f"Не удалось проверить лот {data['lot_id']}: {str(error).splitlines()[0][:300]}",
+                )
+        _show_settings(cardinal, call.message.chat.id, call.message.id)
     elif action == "upload":
         _prompt(cardinal, call, "cg_accounts", "Отправьте .txt/.csv документ или аккаунты текстом, по одному в строке.")
+    elif action == "template":
+        with LOCK:
+            current = _load()["template"]
+        _prompt(
+            cardinal,
+            call,
+            "cg_template",
+            f"{TEMPLATE_HELP}\n\nТекущий шаблон:\n{current}\n\nОтправьте новый шаблон одним сообщением.",
+        )
     elif action == "toggle":
         with LOCK:
             data = _load()

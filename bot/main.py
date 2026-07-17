@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import contextlib
 import html
 import io
+import json
 import logging
 import os
 import platform
@@ -68,6 +70,27 @@ from bot.services.update_service import (
     UpdateInstallResult,
     UpdateService,
 )
+
+
+AUTO_RAISE_SETTINGS_PATH = Path(__file__).resolve().parent / "data" / "auto_raise.json"
+
+
+def auto_raise_enabled() -> bool:
+    try:
+        data = json.loads(AUTO_RAISE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        return bool(data.get("enabled", False)) if isinstance(data, dict) else False
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def set_auto_raise_enabled(enabled: bool) -> None:
+    AUTO_RAISE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = AUTO_RAISE_SETTINGS_PATH.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps({"enabled": bool(enabled)}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(AUTO_RAISE_SETTINGS_PATH)
 
 
 LOG_PATH = Path(__file__).resolve().parent / "data" / "moneybot.log"
@@ -249,9 +272,14 @@ def settings_menu() -> InlineKeyboardMarkup:
     builder.button(text="Ответ на отзывы", callback_data="settings:reviews")
     builder.button(text="Уведомления", callback_data="settings:notifications")
     builder.button(text="Системные настройки", callback_data="settings:system")
-    builder.button(text="Поднять все лоты", callback_data="settings:lots:raise")
+    marker = "🟢" if auto_raise_enabled() else "🔴"
+    builder.button(
+        text=f"{marker} Поднятие всех лотов",
+        callback_data="settings:lots:auto_toggle",
+    )
+    builder.button(text="Поднять сейчас", callback_data="settings:lots:raise")
     builder.button(text="Назад", callback_data="menu:main")
-    builder.adjust(2, 1, 1, 1, 1)
+    builder.adjust(2, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -1986,6 +2014,20 @@ async def callback_raise_lots_prompt(
         )
 
 
+@router.callback_query(F.data == "settings:lots:auto_toggle")
+async def callback_auto_raise_toggle(
+    callback: CallbackQuery,
+) -> None:
+    enabled = not auto_raise_enabled()
+    set_auto_raise_enabled(enabled)
+    await callback.answer("Автоподнятие включено" if enabled else "Автоподнятие выключено")
+    if callback.message:
+        marker = "🟢" if enabled else "🔴"
+        await callback.message.edit_text(
+            f"{marker} <b>Поднятие всех лотов {'включено' if enabled else 'выключено'}</b>\n\n"
+            "При включении бот будет пытаться поднять все лоты один раз в час.",
+            reply_markup=settings_menu(),
+        )
 @router.callback_query(F.data == "settings:lots:raise:confirm")
 async def callback_raise_lots_confirm(
     callback: CallbackQuery, auto_delivery: AutoDeliveryService
@@ -2798,8 +2840,6 @@ async def configure_commands(
 ) -> None:
     commands: dict[str, str] = {
         "start": "Главное меню",
-        "profile": "Аккаунт FunPay",
-        "tickets": "Тикеты Support",
         "system": "Ресурсы системы",
         "update": "Проверить обновления",
         "log": "Скачать логи",
@@ -2971,6 +3011,23 @@ async def run_bot(config: BotConfig) -> None:
 
         future.add_done_callback(log_auto_ticket_result)
 
+    async def auto_raise_worker() -> None:
+        while True:
+            await asyncio.sleep(3600)
+            if not auto_raise_enabled():
+                continue
+            try:
+                result = await asyncio.to_thread(auto_delivery.raise_all_lots)
+                if result.categories_raised > 0:
+                    await bot.send_message(
+                        config.owner_id,
+                        "✅ <b>Лоты подняты автоматически</b>\n\n"
+                        f"Категорий поднято: {result.categories_raised} из {result.categories_total}\n"
+                        f"Активных лотов: {result.total_lots}",
+                    )
+            except Exception:
+                logger.exception("Не удалось автоматически поднять лоты")
+
     plugin_manager.add_funpay_message_observer(automation.handle_event)
     plugin_manager.add_funpay_message_observer(notify_funpay_message)
     plugin_manager.add_funpay_order_observer(handle_auto_delivery)
@@ -2983,6 +3040,7 @@ async def run_bot(config: BotConfig) -> None:
     me = await bot.get_me()
     logger.info("Aiogram-бот @%s запущен", me.username)
     update_service.start(notify_update_release)
+    auto_raise_task = asyncio.create_task(auto_raise_worker())
     for pending in auto_tickets.list_pending():
         pending_result = AutoTicketResult(
             "pending",
@@ -2999,6 +3057,9 @@ async def run_bot(config: BotConfig) -> None:
             bot, allowed_updates=dispatcher.resolve_used_update_types()
         )
     finally:
+        auto_raise_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await auto_raise_task
         await asyncio.to_thread(plugin_manager.shutdown)
         await bot.session.close()
 
