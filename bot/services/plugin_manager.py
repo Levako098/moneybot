@@ -280,6 +280,11 @@ class PluginManager:
             "PHPSESSID", self.account.phpsessid
         )
         self.account.golden_seal = fresh_cookies.get("golden_seal", "")
+        parser = BeautifulSoup(response.text, "html.parser")
+        body = parser.find("body")
+        if body and body.get("data-app-data"):
+            self.account.app_data = json.loads(body["data-app-data"])
+            self.account.csrf_token = self.account.app_data["csrf-token"]
 
         def compatible_method(
             account: Account,
@@ -415,6 +420,103 @@ class PluginManager:
 
         self.account._Account__parse_messages = MethodType(
             compatible_parse_messages, self.account
+        )
+
+        def compatible_send_message(
+            account: Account,
+            chat_id: int | str,
+            text: str | None = None,
+            chat_name: str | None = None,
+            image_id: int | None = None,
+            add_to_ignore_list: bool = True,
+            update_last_saved_message: bool = False,
+        ) -> Any:
+            if not account.is_initiated:
+                raise funpay_exceptions.AccountNotInitiatedError()
+
+            headers = {
+                "accept": "*/*",
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "x-requested-with": "XMLHttpRequest",
+            }
+            content = "" if image_id is not None else (
+                f"{account.bot_character}{text}" if text else ""
+            )
+            request_data: dict[str, Any] = {
+                "node": chat_id,
+                "last_message": -1,
+                "content": content,
+            }
+            if image_id is not None:
+                request_data["image_id"] = image_id
+            request = {"action": "chat_message", "data": request_data}
+            objects = [
+                {
+                    "type": "chat_node",
+                    "id": chat_id,
+                    "tag": "00000000",
+                    "data": {
+                        "node": chat_id,
+                        "last_message": -1,
+                        "content": "",
+                    },
+                }
+            ]
+            payload = {
+                "objects": json.dumps(objects),
+                "request": json.dumps(request),
+                "csrf_token": account.csrf_token,
+            }
+            response = account.method(
+                "post", "runner/", headers, payload, raise_not_200=True
+            )
+            json_response = response.json()
+            response_data = json_response.get("response")
+            if not response_data:
+                raise funpay_exceptions.MessageNotDeliveredError(
+                    response, None, chat_id
+                )
+            if (error_text := response_data.get("error")) is not None:
+                raise funpay_exceptions.MessageNotDeliveredError(
+                    response, error_text, chat_id
+                )
+
+            raw_message = json_response["objects"][0]["data"]["messages"][-1]
+            message_parser = BeautifulSoup(raw_message["html"], "html.parser")
+            image_node = message_parser.find("a", {"class": "chat-img-link"})
+            if image_node is not None:
+                image_link = image_node.get("href")
+                message_text = None
+            else:
+                image_link = None
+                text_node = (
+                    message_parser.find("div", {"class": "message-text"})
+                    or message_parser.find("div", {"class": "chat-msg-text"})
+                )
+                message_text = (
+                    text_node.get_text(" ", strip=True) if text_node is not None else ""
+                ).replace(account.bot_character, "", 1)
+
+            message = funpay_types.Message(
+                int(raw_message["id"]),
+                message_text,
+                chat_id,
+                chat_name,
+                account.username,
+                account.id,
+                raw_message["html"],
+                image_link,
+            )
+            message.by_bot = True
+            if account.runner and isinstance(chat_id, int):
+                if add_to_ignore_list:
+                    account.runner.mark_as_by_bot(chat_id, message.id)
+                if update_last_saved_message:
+                    account.runner.update_last_message(chat_id, message_text)
+            return message
+
+        self.account.send_message = MethodType(
+            compatible_send_message, self.account
         )
         if not hasattr(self.account, "get_sales"):
             self.account.get_sales = self.account.get_sells
