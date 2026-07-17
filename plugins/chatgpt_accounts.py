@@ -275,10 +275,16 @@ def _on_callback(cardinal: Any, call: Any) -> None:
 
 def _init(cardinal: Any) -> None:
     cardinal.add_telegram_commands(UUID, [("chatgpt", "Настройки авто-выдачи ChatGPT", True)])
-    cardinal.telegram.msg_handler(_on_command, commands=["chatgpt"])
-    cardinal.telegram.msg_handler(_on_message, content_types=["text", "document"])
+    cardinal.telegram.msg_handler(
+        lambda message: _on_command(cardinal, message), commands=["chatgpt"]
+    )
+    cardinal.telegram.msg_handler(
+        lambda message: _on_message(cardinal, message),
+        content_types=["text", "document"],
+    )
     cardinal.telegram.cbq_handler(
-        _on_callback, lambda call: str(getattr(call, "data", "")).startswith(f"47:{UUID}")
+        lambda call: _on_callback(cardinal, call),
+        lambda call: str(getattr(call, "data", "")).startswith(f"47:{UUID}"),
     )
 
 
