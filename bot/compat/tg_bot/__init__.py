@@ -1,3 +1,6 @@
-from bot.compat.tg_bot import CBT
+from bot.compat.tg_bot import CBT, keyboards, static_keyboards, utils
 
-__all__ = ["CBT"]
+TgBot = None
+TGBot = None
+
+__all__ = ["CBT", "TgBot", "TGBot", "keyboards", "static_keyboards", "utils"]

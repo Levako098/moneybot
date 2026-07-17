@@ -34,6 +34,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import BotConfig, ConfigError, load_config
+from bot.compat.tg_bot import CBT as CARDINAL_CBT
 from bot.funpay_service import FunPayService, FunPayServiceError, ProfileInfo
 from bot.version import __version__
 from bot.services.auto_delivery import (
@@ -380,10 +381,14 @@ def plugins_menu() -> InlineKeyboardMarkup:
 
 def plugin_list_menu(manager: PluginManager) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for plugin in sorted(manager.plugins.values(), key=lambda item: item.name.casefold()):
+    for plugin in sorted(
+        manager.plugins.values(),
+        key=lambda item: (not item.pinned, item.name.casefold()),
+    ):
         status = "🟢" if plugin.enabled else "🔴"
+        pin = "📌 " if plugin.pinned else ""
         builder.button(
-            text=f"{status} · {plugin.name} {plugin.version}",
+            text=f"{status} · {pin}{plugin.name} {plugin.version}",
             callback_data=f"plugin:view:{plugin.uuid}",
         )
     builder.button(text="Добавить плагин", callback_data="plugins:add")
@@ -407,12 +412,23 @@ def plugin_detail(plugin: PluginRecord) -> tuple[str, InlineKeyboardMarkup]:
         text="Выключить" if plugin.enabled else "Включить",
         callback_data=f"plugin:toggle:{plugin.uuid}",
     )
+    builder.button(
+        text="Открепить" if plugin.pinned else "Закрепить",
+        callback_data=f"{CARDINAL_CBT.PIN_PLUGIN}:{plugin.uuid}:0",
+    )
+    if plugin.settings_page and plugin.enabled:
+        builder.button(
+            text="Настройки плагина",
+            callback_data=f"{CARDINAL_CBT.PLUGIN_SETTINGS}:{plugin.uuid}:0",
+        )
+    builder.button(text="Удалить", callback_data=f"plugin:delete:{plugin.uuid}")
     builder.button(text="К списку", callback_data="menu:plugins")
     builder.adjust(1)
     text = (
         f"<b>{html.escape(plugin.name)} {html.escape(plugin.version)}</b>\n\n"
         f"<b>Статус:</b> {status}\n"
         f"<b>Файл:</b> <code>{html.escape(plugin.path.name)}</code>\n\n"
+        f"<b>Автор:</b> {html.escape(plugin.credits or 'не указан')}\n\n"
         f"<b>Описание:</b>\n{html.escape(plugin.description[:1600])}"
         f"{commands}{error}"
     )
@@ -1633,6 +1649,142 @@ async def callback_plugin_view(
     await callback.message.edit_text(text, reply_markup=markup)
 
 
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.PLUGINS_LIST}:"))
+async def callback_cardinal_plugins_list(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Плагины Cardinal</b>",
+            reply_markup=plugin_list_menu(plugin_manager),
+        )
+
+
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.EDIT_PLUGIN}:"))
+async def callback_cardinal_plugin_view(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    parts = str(callback.data or "").split(":")
+    uuid = parts[1] if len(parts) > 1 else ""
+    plugin = plugin_manager.plugins.get(uuid)
+    if not plugin or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer()
+    text, markup = plugin_detail(plugin)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.TOGGLE_PLUGIN}:"))
+async def callback_cardinal_plugin_toggle(
+    callback: CallbackQuery, plugin_manager: PluginManager, bot: Bot
+) -> None:
+    parts = str(callback.data or "").split(":")
+    uuid = parts[1] if len(parts) > 1 else ""
+    if uuid not in plugin_manager.plugins or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer("Применяю...")
+    plugin = await asyncio.to_thread(plugin_manager.toggle, uuid)
+    await configure_commands(bot, plugin_manager.owner_id, plugin_manager)
+    text, markup = plugin_detail(plugin)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.PIN_PLUGIN}:"))
+async def callback_cardinal_plugin_pin(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    parts = str(callback.data or "").split(":")
+    uuid = parts[1] if len(parts) > 1 else ""
+    if uuid not in plugin_manager.plugins or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    plugin = await asyncio.to_thread(plugin_manager.pin_plugin, uuid)
+    await callback.answer("Закреплено" if plugin.pinned else "Откреплено")
+    text, markup = plugin_detail(plugin)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.DELETE_PLUGIN}:"))
+async def callback_cardinal_plugin_delete_prompt(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    parts = str(callback.data or "").split(":")
+    uuid = parts[1] if len(parts) > 1 else ""
+    plugin = plugin_manager.plugins.get(uuid)
+    if not plugin or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer()
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Удалить",
+        callback_data=f"{CARDINAL_CBT.CONFIRM_DELETE_PLUGIN}:{uuid}:0",
+    )
+    builder.button(
+        text="Отмена",
+        callback_data=f"{CARDINAL_CBT.CANCEL_DELETE_PLUGIN}:{uuid}:0",
+    )
+    builder.adjust(2)
+    await callback.message.edit_text(
+        f"<b>Удалить плагин {html.escape(plugin.name)}?</b>",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.CANCEL_DELETE_PLUGIN}:"))
+async def callback_cardinal_plugin_delete_cancel(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    parts = str(callback.data or "").split(":")
+    uuid = parts[1] if len(parts) > 1 else ""
+    plugin = plugin_manager.plugins.get(uuid)
+    if not plugin or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer()
+    text, markup = plugin_detail(plugin)
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith(f"{CARDINAL_CBT.CONFIRM_DELETE_PLUGIN}:"))
+async def callback_cardinal_plugin_delete_confirm(
+    callback: CallbackQuery, plugin_manager: PluginManager, bot: Bot
+) -> None:
+    parts = str(callback.data or "").split(":")
+    uuid = parts[1] if len(parts) > 1 else ""
+    if uuid not in plugin_manager.plugins or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer("Удаляю...")
+    try:
+        await asyncio.to_thread(plugin_manager.delete_plugin, uuid)
+        await configure_commands(bot, plugin_manager.owner_id, plugin_manager)
+        await callback.message.edit_text(
+            "<b>Плагин удалён</b>",
+            reply_markup=plugin_list_menu(plugin_manager),
+        )
+    except Exception as error:
+        await callback.message.edit_text(
+            "<b>Не удалось удалить плагин</b>\n"
+            + html.escape(str(error).splitlines()[0][:300]),
+            reply_markup=plugin_list_menu(plugin_manager),
+        )
+
+
+@router.callback_query(F.data == CARDINAL_CBT.CLEAR_STATE)
+async def callback_cardinal_clear_state(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    if callback.message and callback.from_user:
+        plugin_manager.telegram.clear_state(
+            callback.message.chat.id, callback.from_user.id
+        )
+    await callback.answer("Отменено")
+
+
 @router.callback_query(F.data.startswith("plugin:toggle:"))
 async def callback_plugin_toggle(
     callback: CallbackQuery, plugin_manager: PluginManager, bot: Bot
@@ -1645,6 +1797,55 @@ async def callback_plugin_toggle(
     await configure_commands(bot, plugin_manager.owner_id, plugin_manager)
     text, markup = plugin_detail(plugin)
     await callback.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("plugin:delete:confirm:"))
+async def callback_plugin_delete_confirm(
+    callback: CallbackQuery, plugin_manager: PluginManager, bot: Bot
+) -> None:
+    uuid = str(callback.data or "").split(":", maxsplit=3)[-1]
+    plugin = plugin_manager.plugins.get(uuid)
+    if not plugin or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer("Удаляю плагин...")
+    try:
+        path = await asyncio.to_thread(plugin_manager.delete_plugin, uuid)
+        await configure_commands(bot, plugin_manager.owner_id, plugin_manager)
+        await callback.message.edit_text(
+            f"<b>Плагин удалён</b>\n<code>{html.escape(path.name)}</code>",
+            reply_markup=plugin_list_menu(plugin_manager),
+        )
+    except Exception as error:
+        await callback.message.edit_text(
+            "<b>Не удалось удалить плагин</b>\n"
+            + html.escape(str(error).splitlines()[0][:300]),
+            reply_markup=plugin_list_menu(plugin_manager),
+        )
+
+
+@router.callback_query(F.data.startswith("plugin:delete:"))
+async def callback_plugin_delete_prompt(
+    callback: CallbackQuery, plugin_manager: PluginManager
+) -> None:
+    uuid = str(callback.data or "").split(":", maxsplit=2)[-1]
+    plugin = plugin_manager.plugins.get(uuid)
+    if not plugin or not callback.message:
+        await callback.answer("Плагин не найден", show_alert=True)
+        return
+    await callback.answer()
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Удалить",
+        callback_data=f"plugin:delete:confirm:{uuid}",
+    )
+    builder.button(text="Отмена", callback_data=f"plugin:view:{uuid}")
+    builder.adjust(2)
+    await callback.message.edit_text(
+        f"<b>Удалить плагин {html.escape(plugin.name)}?</b>\n\n"
+        "Будет вызван BIND_TO_DELETE, затем файл плагина будет удалён.",
+        reply_markup=builder.as_markup(),
+    )
 
 
 @router.callback_query(F.data == "menu:settings")
@@ -2726,9 +2927,15 @@ async def run_bot(config: BotConfig) -> None:
         future.add_done_callback(log_notification_result)
 
     def handle_auto_delivery(event: Any) -> None:
+        plugin_manager.run_handlers(
+            plugin_manager.pre_delivery_handlers, (plugin_manager, event)
+        )
         result = auto_delivery.handle_event(event)
         if result is None:
             return
+        plugin_manager.run_handlers(
+            plugin_manager.post_delivery_handlers, (plugin_manager, event)
+        )
         future = asyncio.run_coroutine_threadsafe(
             send_delivery_result(bot, config.owner_id, result), event_loop
         )
@@ -2792,6 +2999,7 @@ async def run_bot(config: BotConfig) -> None:
             bot, allowed_updates=dispatcher.resolve_used_update_types()
         )
     finally:
+        await asyncio.to_thread(plugin_manager.shutdown)
         await bot.session.close()
 
 

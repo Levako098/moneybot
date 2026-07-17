@@ -8,7 +8,9 @@ import logging
 import re
 import sys
 import threading
+import time
 import uuid as uuid_module
+from datetime import datetime
 from types import MethodType
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,11 +22,22 @@ import requests
 from FunPayAPI import Account, Runner
 from FunPayAPI import types as funpay_types
 from FunPayAPI.common import exceptions as funpay_exceptions
+from FunPayAPI.updater import events as funpay_events
 from bs4 import BeautifulSoup
 from telebot.types import CallbackQuery as TeleCallbackQuery
 from telebot.types import Message as TeleMessage
 
 from bot.compat import tg_bot as tg_bot_compat
+from bot.compat import Utils as utils_compat
+from bot.compat import locales as locales_compat
+from bot.compat.Utils import cardinal_tools as cardinal_tools_compat
+from bot.compat.Utils import exceptions as utils_exceptions_compat
+from bot.compat.locales import localizer as localizer_compat
+from bot.compat.tg_bot import bot as tg_bot_bot_compat
+from bot.compat.tg_bot import keyboards as tg_keyboards_compat
+from bot.compat.tg_bot import static_keyboards as tg_static_keyboards_compat
+from bot.compat.tg_bot import utils as tg_utils_compat
+from bot.version import __version__
 
 
 logger = logging.getLogger("moneybot.plugins")
@@ -44,9 +57,16 @@ class PluginRecord:
     enabled: bool = False
     duplicate: bool = False
     loaded: bool = False
+    settings_page: bool = False
+    pinned: bool = False
+    delete_handler: Any = None
     error: str = ""
     module: ModuleType | None = None
     commands: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def plugin(self) -> ModuleType | None:
+        return self.module
 
 
 class CompatTeleBot(telebot.TeleBot):
@@ -82,18 +102,55 @@ class CompatTeleBot(telebot.TeleBot):
 
         return decorator
 
+    def middleware_handler(self, *args: Any, **kwargs: Any):
+        parent = super().middleware_handler(*args, **kwargs)
+        plugin_uuid = self.manager.loading_uuid
+
+        def decorator(handler: Callable):
+            def guarded(update: Any):
+                if not plugin_uuid or self.manager.is_enabled(plugin_uuid):
+                    return handler(update)
+                return None
+
+            return parent(guarded)
+
+        return decorator
+
 
 class CompatTelegram:
     def __init__(self, token: str, owner_id: int, manager: "PluginManager") -> None:
+        self.manager = manager
         self.admin_ids = [owner_id]
         self.bot = CompatTeleBot(token, manager)
         self.user_states: dict[int, dict[int, dict[str, Any]]] = {}
+        self.file_handlers: dict[str, Callable] = {}
+        self.notification_settings: dict[str, dict[str, bool]] = {
+            str(owner_id): {}
+        }
+        self.answer_templates: list[str] = []
+        self.authorized_users: dict[int, dict[str, Any]] = {owner_id: {}}
+        self.commands: dict[str, str] = {}
 
     def msg_handler(self, handler: Callable, **kwargs: Any) -> None:
         self.bot.message_handler(**kwargs)(handler)
 
     def cbq_handler(self, handler: Callable, func: Callable, **kwargs: Any) -> None:
         self.bot.callback_query_handler(func=func, **kwargs)(handler)
+
+    def mdw_handler(self, handler: Callable, **kwargs: Any) -> None:
+        self.bot.middleware_handler(**kwargs)(handler)
+
+    def is_file_handler(self, message: Any) -> bool:
+        state = self.get_state(message.chat.id, message.from_user.id)
+        return bool(state and message.content_type in {"photo", "document"})
+
+    def file_handler(self, state: str, handler: Callable) -> None:
+        self.file_handlers[state] = handler
+
+    def run_file_handlers(self, message: Any) -> None:
+        state = self.get_state(message.chat.id, message.from_user.id)
+        if state and state.get("state") in self.file_handlers:
+            self.file_handlers[state["state"]](message)
 
     def get_state(self, chat_id: int, user_id: int) -> dict[str, Any] | None:
         return self.user_states.get(chat_id, {}).get(user_id)
@@ -127,29 +184,213 @@ class CompatTelegram:
         current = self.get_state(chat_id, user_id)
         return bool(current and current.get("state") == state)
 
+    def is_notification_enabled(
+        self, chat_id: int | str, notification_type: str
+    ) -> bool:
+        settings = self.notification_settings.get(str(chat_id), {})
+        return settings.get(notification_type, True)
+
+    def toggle_notification(self, chat_id: int, notification_type: str) -> bool:
+        settings = self.notification_settings.setdefault(str(chat_id), {})
+        settings[notification_type] = not self.is_notification_enabled(
+            chat_id, notification_type
+        )
+        return settings[notification_type]
+
+    def send_notification(
+        self,
+        text: str | None,
+        keyboard: Any = None,
+        notification_type: str = tg_utils_compat.NotificationTypes.other,
+        photo: bytes | None = None,
+        pin: bool = False,
+    ) -> None:
+        for chat_id in self.admin_ids:
+            if not self.is_notification_enabled(chat_id, notification_type):
+                continue
+            kwargs = {"reply_markup": keyboard} if keyboard is not None else {}
+            if photo is not None:
+                message = self.bot.send_photo(chat_id, photo, caption=text, **kwargs)
+            else:
+                message = self.bot.send_message(chat_id, text or "", **kwargs)
+            if pin:
+                self.bot.pin_chat_message(chat_id, message.id)
+
+    def add_command_to_menu(self, command: str, help_text: str) -> None:
+        command = command.lstrip("/")
+        self.commands[command] = help_text
+        uuid = self.manager.loading_uuid
+        if uuid and uuid in self.manager.plugins:
+            self.manager.plugins[uuid].commands[command] = help_text
+
+    def setup_commands(self) -> None:
+        return None
+
 
 class PluginManager:
     def __init__(self, token: str, owner_id: int, golden_key: str) -> None:
+        PluginManager.instance = self
+        self.VERSION = __version__
+        self.instance_id = int(time.time() * 1000) % 1_000_000_000
+        self.start_time = int(time.time())
+        self.run_id = 0
+        self.running = False
         self.owner_id = owner_id
         self.golden_key = golden_key
         self.loading_uuid: str | None = None
         self.plugins: dict[str, PluginRecord] = {}
+        self.pre_init_handlers: list[Callable] = []
+        self.post_init_handlers: list[Callable] = []
+        self.pre_start_handlers: list[Callable] = []
+        self.post_start_handlers: list[Callable] = []
+        self.pre_stop_handlers: list[Callable] = []
+        self.post_stop_handlers: list[Callable] = []
+        self.init_message_handlers: list[Callable] = []
+        self.messages_list_changed_handlers: list[Callable] = []
+        self.last_chat_message_changed_handlers: list[Callable] = []
         self.new_message_handlers: list[Callable] = []
+        self.init_order_handlers: list[Callable] = []
+        self.orders_list_changed_handlers: list[Callable] = []
         self.new_order_handlers: list[Callable] = []
+        self.order_status_changed_handlers: list[Callable] = []
+        self.pre_delivery_handlers: list[Callable] = []
+        self.post_delivery_handlers: list[Callable] = []
+        self.pre_lots_raise_handlers: list[Callable] = []
+        self.post_lots_raise_handlers: list[Callable] = []
+        self.init_handlers: list[Callable] = []
+        self.exit_handlers: list[Callable] = []
+        self.handler_bind_var_names: dict[str, list[Callable]] = {
+            "BIND_TO_PRE_INIT": self.pre_init_handlers,
+            "BIND_TO_INIT": self.init_handlers,
+            "BIND_TO_POST_INIT": self.post_init_handlers,
+            "BIND_TO_PRE_START": self.pre_start_handlers,
+            "BIND_TO_POST_START": self.post_start_handlers,
+            "BIND_TO_PRE_STOP": self.pre_stop_handlers,
+            "BIND_TO_POST_STOP": self.post_stop_handlers,
+            "BIND_TO_EXIT": self.exit_handlers,
+            "BIND_TO_INIT_MESSAGE": self.init_message_handlers,
+            "BIND_TO_MESSAGES_LIST_CHANGED": self.messages_list_changed_handlers,
+            "BIND_TO_LAST_CHAT_MESSAGE_CHANGED": self.last_chat_message_changed_handlers,
+            "BIND_TO_NEW_MESSAGE": self.new_message_handlers,
+            "BIND_TO_INIT_ORDER": self.init_order_handlers,
+            "BIND_TO_ORDERS_LIST_CHANGED": self.orders_list_changed_handlers,
+            "BIND_TO_NEW_ORDER": self.new_order_handlers,
+            "BIND_TO_ORDER_STATUS_CHANGED": self.order_status_changed_handlers,
+            "BIND_TO_PRE_DELIVERY": self.pre_delivery_handlers,
+            "BIND_TO_POST_DELIVERY": self.post_delivery_handlers,
+            "BIND_TO_PRE_LOTS_RAISE": self.pre_lots_raise_handlers,
+            "BIND_TO_POST_LOTS_RAISE": self.post_lots_raise_handlers,
+        }
         self.funpay_message_observers: list[Callable] = []
         self.funpay_order_observers: list[Callable] = []
         self.telegram = CompatTelegram(token, owner_id, self)
         self.account: Account | None = None
         self.runner: Runner | None = None
+        self.profile = None
+        self.curr_profile = None
         self.tg_profile = None
+        self.last_tg_profile_update = datetime.now()
+        self.balance = None
+        self.blacklist = cardinal_tools_compat.load_blacklist()
+        self.old_users: dict[int, float] = {}
+        self.raise_time: dict[int, float] = {}
+        self.raised_time: dict[int, float] = {}
+        self._exchange_rates: dict[tuple[Any, Any], tuple[float, float]] = {}
+        self.delivery_tests: dict[str, str] = {}
+        self.proxy: dict[str, str] = {}
         self._runner_started = False
         self._runner_allowed = False
+        self._shutdown_done = False
         self._enabled_saved = self._load_enabled()
-        self.MAIN_CFG = configparser.ConfigParser()
-        self.MAIN_CFG["Telegram"] = {"admin_id": str(owner_id)}
-        sys.modules.setdefault("tg_bot", tg_bot_compat)
-        sys.modules.setdefault("tg_bot.CBT", tg_bot_compat.CBT)
+        self._pinned_saved = self._load_pinned()
+        self.MAIN_CFG = self._build_main_config(token, owner_id, golden_key)
+        self.AD_CFG = configparser.ConfigParser(interpolation=None)
+        self.AR_CFG = configparser.ConfigParser(interpolation=None)
+        self.RAW_AR_CFG = configparser.ConfigParser(interpolation=None)
+        self._install_module_compatibility()
+        if str(PLUGINS_DIR) not in sys.path:
+            sys.path.append(str(PLUGINS_DIR))
         self.scan()
+
+    @staticmethod
+    def _build_main_config(
+        token: str, owner_id: int, golden_key: str
+    ) -> configparser.ConfigParser:
+        config = configparser.ConfigParser(interpolation=None)
+        config.optionxform = str
+        config["FunPay"] = {
+            "golden_key": golden_key,
+            "user_agent": "",
+            "autoRaise": "0",
+            "autoResponse": "0",
+            "autoDelivery": "0",
+            "multiDelivery": "0",
+            "autoRestore": "0",
+            "autoDisable": "0",
+            "oldMsgGetMode": "0",
+            "keepSentMessagesUnread": "0",
+            "locale": "ru",
+        }
+        config["Telegram"] = {
+            "enabled": "1",
+            "token": token,
+            "admin_id": str(owner_id),
+            "proxy": "",
+            "blockLogin": "1",
+        }
+        config["BlockList"] = {
+            "blockDelivery": "0",
+            "blockResponse": "0",
+            "blockNewMessageNotification": "0",
+            "blockNewOrderNotification": "0",
+            "blockCommandNotification": "0",
+        }
+        config["NewMessageView"] = {
+            "includeMyMessages": "1",
+            "includeFPMessages": "1",
+            "includeBotMessages": "1",
+            "notifyOnlyMyMessages": "0",
+            "notifyOnlyFPMessages": "0",
+            "notifyOnlyBotMessages": "0",
+            "showImageName": "1",
+        }
+        config["Greetings"] = {
+            "ignoreSystemMessages": "0",
+            "onlyNewChats": "0",
+            "sendGreetings": "0",
+            "greetingsText": "",
+            "greetingsCooldown": "2",
+        }
+        config["OrderConfirm"] = {"watermark": "0", "sendReply": "0", "replyText": ""}
+        config["ReviewReply"] = {
+            **{f"star{stars}Reply": "0" for stars in range(1, 6)},
+            **{f"star{stars}ReplyText": "" for stars in range(1, 6)},
+        }
+        config["Proxy"] = {"enable": "0", "proxy": "", "check": "0"}
+        config["Other"] = {"watermark": "", "requestsDelay": "4", "language": "ru"}
+        return config
+
+    def _install_module_compatibility(self) -> None:
+        cardinal_module = ModuleType("cardinal")
+        cardinal_module.Cardinal = PluginManager
+        cardinal_module.PluginData = PluginRecord
+        cardinal_module.get_cardinal = lambda: self
+        tg_bot_bot_compat.TGBot = CompatTelegram
+        tg_bot_bot_compat.TgBot = CompatTelegram
+        tg_bot_compat.TGBot = CompatTelegram
+        tg_bot_compat.TgBot = CompatTelegram
+        sys.modules["cardinal"] = cardinal_module
+        sys.modules["tg_bot"] = tg_bot_compat
+        sys.modules["tg_bot.CBT"] = tg_bot_compat.CBT
+        sys.modules["tg_bot.bot"] = tg_bot_bot_compat
+        sys.modules["tg_bot.utils"] = tg_utils_compat
+        sys.modules["tg_bot.keyboards"] = tg_keyboards_compat
+        sys.modules["tg_bot.static_keyboards"] = tg_static_keyboards_compat
+        sys.modules["Utils"] = utils_compat
+        sys.modules["Utils.cardinal_tools"] = cardinal_tools_compat
+        sys.modules["Utils.exceptions"] = utils_exceptions_compat
+        sys.modules["locales"] = locales_compat
+        sys.modules["locales.localizer"] = localizer_compat
 
     def _load_enabled(self) -> set[str]:
         try:
@@ -158,11 +399,29 @@ class PluginManager:
         except (OSError, ValueError, TypeError):
             return set()
 
+    def _load_pinned(self) -> set[str]:
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return set(data.get("pinned", []))
+        except (OSError, ValueError, TypeError):
+            return set()
+
     def _save_enabled(self) -> None:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        enabled = sorted(x.uuid for x in self.plugins.values() if x.enabled)
+        self._enabled_saved = {
+            item.uuid for item in self.plugins.values() if item.enabled
+        }
+        self._pinned_saved = {
+            item.uuid for item in self.plugins.values() if item.pinned
+        }
+        enabled = sorted(self._enabled_saved)
+        pinned = sorted(self._pinned_saved)
         STATE_FILE.write_text(
-            json.dumps({"enabled": enabled}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"enabled": enabled, "pinned": pinned},
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -181,7 +440,8 @@ class PluginManager:
                 continue
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id in {
-                    "UUID", "NAME", "VERSION", "DESCRIPTION", "CREDITS"
+                    "UUID", "NAME", "VERSION", "DESCRIPTION", "CREDITS",
+                    "SETTINGS_PAGE",
                 }:
                     try:
                         values[target.id] = ast.literal_eval(node.value)
@@ -202,6 +462,7 @@ class PluginManager:
             description=str(values.get("DESCRIPTION") or ""),
             credits=str(values.get("CREDITS") or ""),
             path=path,
+            settings_page=bool(values.get("SETTINGS_PAGE", False)),
         )
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or len(node.args) < 2:
@@ -259,6 +520,7 @@ class PluginManager:
         }
         for record in self.plugins.values():
             record.enabled = record.uuid in self._enabled_saved and not record.duplicate
+            record.pinned = record.uuid in self._pinned_saved and not record.duplicate
 
     def install_plugin(self, file_name: str, content: bytes) -> PluginRecord:
         if len(content) > 2 * 1024 * 1024:
@@ -304,9 +566,14 @@ class PluginManager:
                 temporary.unlink()
 
     def initialize(self) -> None:
+        if self.account is not None:
+            return
         self.account = Account(self.golden_key).get()
         self._install_account_compatibility()
-        self.tg_profile = self.account.get_user(self.account.id)
+        self.profile = self.account.get_user(self.account.id)
+        self.curr_profile = self.profile
+        self.tg_profile = self.profile
+        self.last_tg_profile_update = datetime.now()
         for record in list(self.plugins.values()):
             if record.enabled:
                 self.enable(record.uuid, save=False)
@@ -339,6 +606,7 @@ class PluginManager:
             payload: Any,
             exclude_phpsessid: bool = False,
             raise_not_200: bool = False,
+            locale: str | None = None,
         ):
             headers = dict(headers or {})
             cookies = [f"golden_key={account.golden_key}"]
@@ -354,6 +622,15 @@ class PluginManager:
                 if api_method.startswith("https://funpay.com")
                 else "https://funpay.com/" + api_method
             )
+            if locale and request_method == "get":
+                separator = "&" if "?" in url else "?"
+                url = f"{url}{separator}setlocale={locale}"
+            elif locale and locale != "ru" and request_method == "post":
+                prefix = "https://funpay.com/"
+                if url.startswith(prefix) and not url.startswith(
+                    f"{prefix}{locale}/"
+                ):
+                    url = f"{prefix}{locale}/{url[len(prefix):]}"
             result = getattr(requests, request_method)(
                 url,
                 headers=headers,
@@ -472,10 +749,13 @@ class PluginManager:
             chat_id: int | str,
             text: str | None = None,
             chat_name: str | None = None,
+            interlocutor_id: int | None = None,
             image_id: int | None = None,
             add_to_ignore_list: bool = True,
             update_last_saved_message: bool = False,
+            leave_as_unread: bool = False,
         ) -> Any:
+            del interlocutor_id, leave_as_unread
             if not account.is_initiated:
                 raise funpay_exceptions.AccountNotInitiatedError()
 
@@ -563,8 +843,54 @@ class PluginManager:
         self.account.send_message = MethodType(
             compatible_send_message, self.account
         )
-        if not hasattr(self.account, "get_sales"):
-            self.account.get_sales = self.account.get_sells
+        original_send_image = self.account.send_image
+
+        def compatible_send_image(
+            account: Account,
+            chat_id: int,
+            image: Any,
+            chat_name: str | None = None,
+            interlocutor_id: int | None = None,
+            add_to_ignore_list: bool = True,
+            update_last_saved_message: bool = False,
+            leave_as_unread: bool = False,
+        ) -> Any:
+            del account, interlocutor_id, leave_as_unread
+            return original_send_image(
+                chat_id,
+                image,
+                chat_name,
+                add_to_ignore_list,
+                update_last_saved_message,
+            )
+
+        self.account.send_image = MethodType(compatible_send_image, self.account)
+
+        def compatible_get_sales(
+            account: Account,
+            start_from: str | None = None,
+            include_paid: bool = True,
+            include_closed: bool = True,
+            include_refunded: bool = True,
+            exclude_ids: list[str] | None = None,
+            locale: str | None = None,
+            subcategories: dict[str, Any] | None = None,
+            sudcategories: dict[str, Any] | None = None,
+            **filters: Any,
+        ) -> tuple[str | None, list[Any], str, dict[str, Any]]:
+            next_id, orders = account.get_sells(
+                start_from=start_from,
+                include_paid=include_paid,
+                include_closed=include_closed,
+                include_refunded=include_refunded,
+                exclude_ids=exclude_ids,
+                **filters,
+            )
+            known_subcategories = subcategories or sudcategories or {}
+            account_locale = getattr(account, "locale", None) or "ru"
+            return next_id, orders, locale or account_locale, known_subcategories
+
+        self.account.get_sales = MethodType(compatible_get_sales, self.account)
         if not hasattr(self.account, "get_my_subcategory_lots"):
             def get_my_subcategory_lots(account: Account, subcategory_id: int):
                 profile = account.get_user(account.id)
@@ -588,6 +914,8 @@ class PluginManager:
             return record
         record.error = ""
         try:
+            runner_was_started = self._runner_started
+            just_loaded = False
             if not record.loaded:
                 self.loading_uuid = uuid
                 module_name = f"moneybot_plugin_{uuid.replace('-', '_')}"
@@ -609,18 +937,17 @@ class PluginManager:
                     pass
                 record.module = module
                 record.loaded = True
-                for name, target in (
-                    ("BIND_TO_NEW_MESSAGE", self.new_message_handlers),
-                    ("BIND_TO_NEW_ORDER", self.new_order_handlers),
-                ):
-                    for handler in getattr(module, name, []) or []:
-                        handler.plugin_uuid = uuid
-                        if handler not in target:
-                            target.append(handler)
-                for hook in getattr(module, "BIND_TO_PRE_INIT", []) or []:
-                    hook.plugin_uuid = uuid
-                    hook(self)
+                record.delete_handler = getattr(module, "BIND_TO_DELETE", None)
+                just_loaded = True
+                self._register_module_handlers(module, uuid)
             record.enabled = True
+            if just_loaded:
+                self.loading_uuid = uuid
+                self._run_module_bindings(record.module, ("BIND_TO_PRE_INIT", "BIND_TO_INIT"))
+                self._run_module_bindings(record.module, ("BIND_TO_POST_INIT",))
+            if just_loaded and runner_was_started:
+                self._run_module_bindings(record.module, ("BIND_TO_PRE_START",))
+                self._run_module_bindings(record.module, ("BIND_TO_POST_START",))
             if save:
                 self._save_enabled()
             self.start_runner()
@@ -631,6 +958,57 @@ class PluginManager:
         finally:
             self.loading_uuid = None
         return record
+
+    @staticmethod
+    def _binding_functions(module: ModuleType | None, name: str) -> list[Callable]:
+        if module is None:
+            return []
+        value = getattr(module, name, None)
+        if value is None:
+            return []
+        if callable(value):
+            return [value]
+        return [item for item in value if callable(item)]
+
+    def _register_module_handlers(self, module: ModuleType, uuid: str) -> None:
+        for name, target in self.handler_bind_var_names.items():
+            for handler in self._binding_functions(module, name):
+                handler.plugin_uuid = uuid
+                if handler not in target:
+                    target.append(handler)
+
+    def add_handlers_from_plugin(
+        self, plugin: ModuleType, uuid: str | None = None
+    ) -> None:
+        """Register Cardinal lifecycle and FunPay handlers from a module."""
+        for name, target in self.handler_bind_var_names.items():
+            for handler in self._binding_functions(plugin, name):
+                handler.plugin_uuid = uuid
+                if handler not in target:
+                    target.append(handler)
+
+    def add_handlers(self) -> None:
+        """Register handlers exposed by every plugin module already loaded."""
+        for uuid, record in self.plugins.items():
+            if record.module is not None:
+                self.add_handlers_from_plugin(record.module, uuid)
+
+    def _run_module_bindings(
+        self, module: ModuleType | None, names: tuple[str, ...]
+    ) -> None:
+        for name in names:
+            for handler in self._binding_functions(module, name):
+                handler(self)
+
+    def run_handlers(self, handlers_list: list[Callable], args: tuple[Any, ...]) -> None:
+        for handler in list(handlers_list):
+            uuid = getattr(handler, "plugin_uuid", None)
+            if uuid is not None and not self.is_enabled(uuid):
+                continue
+            try:
+                handler(*args)
+            except Exception:
+                logger.exception("Ошибка обработчика плагина %s", uuid or "core")
 
     @staticmethod
     def _activate_pydantic_v1() -> dict[str, Any]:
@@ -668,11 +1046,62 @@ class PluginManager:
     def toggle(self, uuid: str) -> PluginRecord:
         return self.disable(uuid) if self.is_enabled(uuid) else self.enable(uuid)
 
-    def add_telegram_commands(self, uuid: str, commands: list[tuple[str, str, bool]]) -> None:
+    def toggle_plugin(self, uuid: str) -> PluginRecord:
+        return self.toggle(uuid)
+
+    def pin_plugin(self, uuid: str) -> PluginRecord:
+        record = self.plugins[uuid]
+        record.pinned = not record.pinned
+        self._save_enabled()
+        return record
+
+    def delete_plugin(self, uuid: str) -> Path:
+        record = self.plugins[uuid]
+        self._run_module_bindings(record.module, ("BIND_TO_DELETE",))
+        path = record.path.resolve()
+        if path.parent != PLUGINS_DIR.resolve():
+            raise ValueError("Путь плагина находится вне каталога plugins")
+        path.unlink(missing_ok=True)
+        self.plugins.pop(uuid, None)
+        self._enabled_saved.discard(uuid)
+        self._pinned_saved.discard(uuid)
+        self._save_enabled()
+        return path
+
+    def shutdown(self) -> None:
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self.run_handlers(self.pre_stop_handlers, (self,))
+        self.run_handlers(self.exit_handlers, (self,))
+        self.run_handlers(self.post_stop_handlers, (self,))
+        self.running = False
+
+    def init(self) -> "PluginManager":
+        self.initialize()
+        return self
+
+    def run(self) -> "PluginManager":
+        self.activate_runner()
+        return self
+
+    def start(self) -> "PluginManager":
+        self.activate_runner()
+        return self
+
+    def stop(self) -> None:
+        self.shutdown()
+
+    def add_telegram_commands(self, uuid: str, commands: list[tuple]) -> None:
         record = self.plugins.get(uuid)
         if record:
-            for command, description, _ in commands:
+            for item in commands:
+                if len(item) < 2:
+                    continue
+                command, description = str(item[0]).lstrip("/"), str(item[1])
                 record.commands[command] = description
+                if len(item) < 3 or bool(item[2]):
+                    self.telegram.add_command_to_menu(command, description)
 
     def add_funpay_message_observer(self, observer: Callable) -> None:
         if observer not in self.funpay_message_observers:
@@ -682,10 +1111,111 @@ class PluginManager:
         if observer not in self.funpay_order_observers:
             self.funpay_order_observers.append(observer)
 
-    def send_message(self, chat_id: int, text: str) -> Any:
+    @staticmethod
+    def split_text(text: str) -> list[str]:
+        lines = text.splitlines()
+        return ["\n".join(lines[index:index + 20]) for index in range(0, len(lines), 20)]
+
+    def parse_message_entities(self, text: str) -> list[str | int | float]:
+        result: list[str | int | float] = []
+        pattern = re.compile(r"\$(photo|sleep)=([^\s]+)")
+        position = 0
+        for match in pattern.finditer(text):
+            before = text[position:match.start()].strip()
+            if before:
+                result.extend(self.split_text(before))
+            if match.group(1) == "photo":
+                result.append(int(match.group(2)))
+            else:
+                result.append(float(match.group(2)))
+            position = match.end()
+        tail = text[position:].strip()
+        if tail:
+            result.extend(self.split_text(tail))
+        return result
+
+    def send_message(
+        self,
+        chat_id: int | str,
+        message_text: str,
+        chat_name: str | None = None,
+        interlocutor_id: int | None = None,
+        attempts: int = 3,
+        watermark: bool = True,
+    ) -> list[Any] | None:
+        del interlocutor_id, watermark
         if not self.account:
             raise RuntimeError("FunPay account is not initialized")
-        return self.account.send_message(chat_id, text)
+        entities = self.parse_message_entities(message_text)
+        if not entities:
+            return None
+        sent = []
+        for entity in entities:
+            if isinstance(entity, float):
+                time.sleep(entity)
+                continue
+            for attempt in range(max(1, attempts)):
+                try:
+                    if isinstance(entity, int):
+                        message = self.account.send_image(chat_id, entity, chat_name)
+                    else:
+                        message = self.account.send_message(chat_id, entity, chat_name)
+                    sent.append(message)
+                    break
+                except Exception:
+                    if attempt + 1 >= max(1, attempts):
+                        logger.exception("Не удалось отправить сообщение плагина в FunPay")
+                        return []
+                    time.sleep(1)
+        return sent
+
+    def get_order_from_object(self, obj: Any, order_id: str | None = None) -> Any:
+        if not self.account:
+            return None
+        candidate = order_id
+        if candidate is None:
+            candidate = str(getattr(obj, "id", "") or "").lstrip("#")
+            if not candidate:
+                match = re.search(r"#[A-Z0-9]{6,}", str(obj), re.IGNORECASE)
+                candidate = match.group(0).lstrip("#") if match else ""
+        if not candidate or candidate == "ADTEST":
+            return None
+        try:
+            order = self.account.get_order(candidate)
+            setattr(obj, "_order", order)
+            return order
+        except Exception:
+            logger.exception("Не удалось получить заказ #%s", candidate)
+            return None
+
+    def get_exchange_rate(
+        self, base_currency: Any, target_currency: Any, min_interval: int = 60
+    ) -> float:
+        if base_currency == target_currency:
+            return 1.0
+        cached = self._exchange_rates.get((base_currency, target_currency))
+        if cached and time.time() - cached[1] < min_interval:
+            return cached[0]
+        if not self.account:
+            raise RuntimeError("FunPay account is not initialized")
+        base_rate, base_reference = self.account.get_exchange_rate(base_currency)
+        target_rate, target_reference = self.account.get_exchange_rate(target_currency)
+        if base_reference != target_reference:
+            raise RuntimeError("FunPay вернул несовместимые базовые валюты")
+        result = float(target_rate) / float(base_rate)
+        self._exchange_rates[(base_currency, target_currency)] = (result, time.time())
+        return result
+
+    def update_session(self, attempts: int = 3) -> bool:
+        if not self.account:
+            return False
+        for _ in range(max(1, attempts)):
+            try:
+                self.account.get(update_phpsessid=True)
+                return True
+            except Exception:
+                time.sleep(1)
+        return False
 
     def get_rating_restrictions(self) -> list[dict[str, str]]:
         if not self.account:
@@ -714,14 +1244,146 @@ class PluginManager:
     def update_lots_and_categories(self) -> None:
         if self.account:
             self.account.get()
-            self.tg_profile = self.account.get_user(self.account.id)
+            self.profile = self.account.get_user(self.account.id)
+            self.curr_profile = self.profile
+            self.tg_profile = self.profile
+            self.last_tg_profile_update = datetime.now()
+
+    def switch_msg_get_mode(self) -> bool:
+        current = self.MAIN_CFG["FunPay"].getboolean("oldMsgGetMode")
+        self.MAIN_CFG["FunPay"]["oldMsgGetMode"] = "0" if current else "1"
+        return not current
+
+    @staticmethod
+    def save_config(config: configparser.ConfigParser, file_path: str) -> None:
+        with open(file_path, "w", encoding="utf-8") as config_file:
+            config.write(config_file)
+
+    @property
+    def autoraise_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("autoRaise")
+
+    @property
+    def autoresponse_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("autoResponse")
+
+    @property
+    def autodelivery_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("autoDelivery")
+
+    @property
+    def multidelivery_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("multiDelivery")
+
+    @property
+    def autorestore_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("autoRestore")
+
+    @property
+    def autodisable_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("autoDisable")
+
+    @property
+    def old_mode_enabled(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("oldMsgGetMode")
+
+    @property
+    def keep_sent_messages_unread(self) -> bool:
+        return self.MAIN_CFG["FunPay"].getboolean("keepSentMessagesUnread")
+
+    @property
+    def show_image_name(self) -> bool:
+        return self.MAIN_CFG["NewMessageView"].getboolean("showImageName")
+
+    def _config_flag(self, section: str, option: str) -> bool:
+        return self.MAIN_CFG[section].getboolean(option)
+
+    @property
+    def bl_delivery_enabled(self) -> bool:
+        return self._config_flag("BlockList", "blockDelivery")
+
+    @property
+    def bl_response_enabled(self) -> bool:
+        return self._config_flag("BlockList", "blockResponse")
+
+    @property
+    def bl_msg_notification_enabled(self) -> bool:
+        return self._config_flag("BlockList", "blockNewMessageNotification")
+
+    @property
+    def bl_order_notification_enabled(self) -> bool:
+        return self._config_flag("BlockList", "blockNewOrderNotification")
+
+    @property
+    def bl_cmd_notification_enabled(self) -> bool:
+        return self._config_flag("BlockList", "blockCommandNotification")
+
+    @property
+    def include_my_msg_enabled(self) -> bool:
+        return self._config_flag("NewMessageView", "includeMyMessages")
+
+    @property
+    def include_fp_msg_enabled(self) -> bool:
+        return self._config_flag("NewMessageView", "includeFPMessages")
+
+    @property
+    def include_bot_msg_enabled(self) -> bool:
+        return self._config_flag("NewMessageView", "includeBotMessages")
+
+    @property
+    def only_my_msg_enabled(self) -> bool:
+        return self._config_flag("NewMessageView", "notifyOnlyMyMessages")
+
+    @property
+    def only_fp_msg_enabled(self) -> bool:
+        return self._config_flag("NewMessageView", "notifyOnlyFPMessages")
+
+    @property
+    def only_bot_msg_enabled(self) -> bool:
+        return self._config_flag("NewMessageView", "notifyOnlyBotMessages")
+
+    @property
+    def block_tg_login(self) -> bool:
+        return self._config_flag("Telegram", "blockLogin")
+
+    def raise_lots(self) -> int:
+        if not self.account or not self.curr_profile:
+            return 10
+        categories: dict[int, tuple[Any, set[int]]] = {}
+        for lot in self.curr_profile.get_lots():
+            subcategory = getattr(lot, "subcategory", None)
+            category = getattr(subcategory, "category", None)
+            category_id = getattr(category, "id", None)
+            subcategory_id = getattr(subcategory, "id", None)
+            type_name = str(getattr(getattr(subcategory, "type", None), "name", ""))
+            if category_id is None or subcategory_id is None or type_name == "CURRENCY":
+                continue
+            row = categories.setdefault(int(category_id), (category, set()))
+            row[1].add(int(subcategory_id))
+        for category_id, (category, subcategories) in categories.items():
+            self.run_handlers(self.pre_lots_raise_handlers, (self, category))
+            error_text = ""
+            try:
+                self.account.raise_lots(category_id, sorted(subcategories))
+                self.raised_time[category_id] = time.time()
+            except Exception as error:
+                error_text = str(error).splitlines()[0][:300]
+            self.run_handlers(
+                self.post_lots_raise_handlers, (self, category, error_text)
+            )
+        return 10
 
     def start_runner(self) -> None:
         if not self._runner_allowed or self._runner_started or not self.account:
             return
+        self.run_handlers(self.pre_start_handlers, (self,))
         self._runner_started = True
+        self.running = True
+        self.run_id += 1
         self.runner = Runner(self.account)
+        self.account.runner = self.runner
         threading.Thread(target=self._runner_loop, daemon=True, name="funpay-plugins").start()
+        self.run_handlers(self.post_start_handlers, (self,))
 
     def activate_runner(self) -> None:
         self._runner_allowed = True
@@ -729,6 +1391,16 @@ class PluginManager:
 
     def _runner_loop(self) -> None:
         assert self.runner is not None
+        event_handlers = {
+            funpay_events.EventTypes.INITIAL_CHAT: self.init_message_handlers,
+            funpay_events.EventTypes.CHATS_LIST_CHANGED: self.messages_list_changed_handlers,
+            funpay_events.EventTypes.LAST_CHAT_MESSAGE_CHANGED: self.last_chat_message_changed_handlers,
+            funpay_events.EventTypes.NEW_MESSAGE: self.new_message_handlers,
+            funpay_events.EventTypes.INITIAL_ORDER: self.init_order_handlers,
+            funpay_events.EventTypes.ORDERS_LIST_CHANGED: self.orders_list_changed_handlers,
+            funpay_events.EventTypes.NEW_ORDER: self.new_order_handlers,
+            funpay_events.EventTypes.ORDER_STATUS_CHANGED: self.order_status_changed_handlers,
+        }
         while True:
             try:
                 for event in self.runner.listen(requests_delay=4):
@@ -745,17 +1417,8 @@ class PluginManager:
                                 observer(event)
                             except Exception:
                                 logger.exception("Ошибка observer заказа FunPay")
-                    handlers = (
-                        self.new_message_handlers if "Message" in name else
-                        self.new_order_handlers if "Order" in name else []
-                    )
-                    for handler in list(handlers):
-                        uuid = getattr(handler, "plugin_uuid", "")
-                        if self.is_enabled(uuid):
-                            try:
-                                handler(self, event)
-                            except Exception:
-                                logger.exception("Ошибка event handler плагина %s", uuid)
+                    handlers = event_handlers.get(getattr(event, "type", None), [])
+                    self.run_handlers(handlers, (self, event))
             except Exception:
                 logger.exception("Ошибка FunPay Runner, повтор через 10 секунд")
                 threading.Event().wait(10)
