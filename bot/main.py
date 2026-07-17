@@ -412,8 +412,29 @@ def auto_ticket_settings_menu(settings: dict[str, Any]) -> InlineKeyboardMarkup:
     )
     builder.button(text="Текст тикета", callback_data="tickets:settings:template")
     builder.button(text="Проверить сейчас", callback_data="tickets:settings:check")
+    builder.button(text="Тест подтверждения", callback_data="tickets:settings:test")
     builder.button(text="Назад", callback_data="menu:tickets")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def auto_ticket_confirmation_menu(
+    confirmation_id: str, test: bool = False
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if test:
+        builder.button(text="Отправить", callback_data="autoticket:test:confirm")
+        builder.button(text="Отменить", callback_data="autoticket:test:cancel")
+    else:
+        builder.button(
+            text="Отправить",
+            callback_data=f"autoticket:confirm:{confirmation_id}",
+        )
+        builder.button(
+            text="Отменить",
+            callback_data=f"autoticket:cancel:{confirmation_id}",
+        )
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -785,6 +806,7 @@ def format_system_settings(system_settings: SystemSettingsService) -> str:
 
 def format_auto_ticket_settings(auto_tickets: AutoTicketService) -> str:
     settings = auto_tickets.get_settings()
+    database = auto_tickets.get_database_stats()
     status = "включены" if settings["enabled"] else "выключены"
     scope = (
         "все неподтверждённые заказы"
@@ -806,12 +828,21 @@ def format_auto_ticket_settings(auto_tickets: AutoTicketService) -> str:
         f"<b>Интервал проверки:</b> {settings['check_interval_minutes']} мин\n"
         f"<b>Заказов в тикете:</b> до {settings['max_orders_per_ticket']}\n"
         f"<b>Последняя проверка:</b> {last_check}\n\n"
+        f"<b>База SQLite:</b> ожидают {database['pending']}, "
+        f"отправлены {database['sent']}, отменены {database['cancelled']}\n\n"
         f"<b>Текст:</b>\n<code>{template}</code>\n\n"
-        "Каждый заказ отправляется в Support только один раз."
+        "Перед каждой отправкой бот обязательно запросит подтверждение."
     )
 
 
 def format_auto_ticket_result(result: AutoTicketResult) -> str:
+    if result.status == "pending":
+        orders = ", ".join(f"#{order_id}" for order_id in result.order_ids)
+        return (
+            "<b>Отправить автотикет?</b>\n\n"
+            f"Заказы: {html.escape(orders)}\n"
+            "Support будет вызван только после нажатия «Отправить»."
+        )
     if result.status == "sent":
         orders = ", ".join(f"#{order_id}" for order_id in result.order_ids)
         ticket = f" #{html.escape(result.ticket_id)}" if result.ticket_id else ""
@@ -822,6 +853,12 @@ def format_auto_ticket_result(result: AutoTicketResult) -> str:
         return "Сначала включите автотикеты."
     if result.status == "busy":
         return "Проверка уже выполняется."
+    if result.status == "cancelled":
+        return "Автотикет отменён. Заказы сохранены в базе как отменённые."
+    if result.status == "missing":
+        return "Подтверждение не найдено в базе."
+    if result.status == "sending":
+        return "Этот автотикет уже отправляется."
     return "<b>Ошибка автотикета</b>\n" + html.escape(result.error or "неизвестная ошибка")
 
 
@@ -1902,7 +1939,7 @@ async def callback_auto_ticket_limit(
     if callback.message:
         await callback.message.edit_text(
             "<b>Лимит заказов</b>\n\n"
-            f"Сейчас: {current}. Отправьте число от 1 до 10.",
+            f"Сейчас: {current}. Отправьте число от 1 до 100.",
             reply_markup=auto_ticket_cancel_menu(),
         )
 
@@ -1912,8 +1949,8 @@ async def receive_auto_ticket_limit(
     message: Message, state: FSMContext, auto_tickets: AutoTicketService
 ) -> None:
     value = str(message.text or "").strip()
-    if not value.isdigit() or not 1 <= int(value) <= 10:
-        await message.answer("Введите целое число от 1 до 10.")
+    if not value.isdigit() or not 1 <= int(value) <= 100:
+        await message.answer("Введите целое число от 1 до 100.")
         return
     auto_tickets.set_max_orders(int(value))
     await state.clear()
@@ -1969,12 +2006,81 @@ async def callback_auto_ticket_check(
         return
     await callback.message.edit_text("Проверяю неподтверждённые заказы...")
     result = await asyncio.to_thread(auto_tickets.run_check)
+    if result.status == "pending":
+        await callback.message.edit_text(
+            format_auto_ticket_settings(auto_tickets),
+            reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
+        )
+        await callback.message.answer(
+            format_auto_ticket_result(result),
+            reply_markup=auto_ticket_confirmation_menu(result.confirmation_id),
+        )
+        return
     await callback.message.edit_text(
         format_auto_ticket_settings(auto_tickets)
         + "\n\n"
         + format_auto_ticket_result(result),
         reply_markup=auto_ticket_settings_menu(auto_tickets.get_settings()),
     )
+
+
+@router.callback_query(F.data == "tickets:settings:test")
+async def callback_auto_ticket_test(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "<b>Отправить автотикет?</b>\n\n"
+            "Заказы: <code>#TEST0001, #TEST0002</code>\n"
+            "Это тест: Support вызван не будет.",
+            reply_markup=auto_ticket_confirmation_menu("test", test=True),
+        )
+
+
+@router.callback_query(F.data == "autoticket:test:confirm")
+async def callback_auto_ticket_test_confirm(callback: CallbackQuery) -> None:
+    await callback.answer("Тест: отправка подтверждена", show_alert=True)
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Тестовое подтверждение принято.</b>\nSupport не вызывался."
+        )
+
+
+@router.callback_query(F.data == "autoticket:test:cancel")
+async def callback_auto_ticket_test_cancel(callback: CallbackQuery) -> None:
+    await callback.answer("Тест: отправка отменена", show_alert=True)
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Тестовое подтверждение отменено.</b>\nSupport не вызывался."
+        )
+
+
+@router.callback_query(F.data.startswith("autoticket:confirm:"))
+async def callback_auto_ticket_confirm(
+    callback: CallbackQuery, auto_tickets: AutoTicketService
+) -> None:
+    confirmation_id = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
+    await callback.answer("Отправляю тикет...")
+    if not callback.message:
+        return
+    await callback.message.edit_text("Отправляю подтверждённый тикет в Support...")
+    result = await asyncio.to_thread(auto_tickets.confirm, confirmation_id)
+    markup = (
+        auto_ticket_confirmation_menu(confirmation_id)
+        if result.status == "error"
+        else None
+    )
+    await callback.message.edit_text(format_auto_ticket_result(result), reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("autoticket:cancel:"))
+async def callback_auto_ticket_cancel(
+    callback: CallbackQuery, auto_tickets: AutoTicketService
+) -> None:
+    confirmation_id = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
+    result = await asyncio.to_thread(auto_tickets.cancel, confirmation_id)
+    await callback.answer("Автотикет отменён" if result.status == "cancelled" else "Уже обработан")
+    if callback.message:
+        await callback.message.edit_text(format_auto_ticket_result(result))
 
 
 @router.callback_query(F.data == "tickets:list")
@@ -2359,8 +2465,17 @@ async def run_bot(config: BotConfig) -> None:
         future.add_done_callback(log_delivery_result)
 
     def notify_auto_ticket(result: AutoTicketResult) -> None:
+        markup = (
+            auto_ticket_confirmation_menu(result.confirmation_id)
+            if result.status == "pending"
+            else None
+        )
         future = asyncio.run_coroutine_threadsafe(
-            bot.send_message(config.owner_id, format_auto_ticket_result(result)),
+            bot.send_message(
+                config.owner_id,
+                format_auto_ticket_result(result),
+                reply_markup=markup,
+            ),
             event_loop,
         )
 
@@ -2382,6 +2497,17 @@ async def run_bot(config: BotConfig) -> None:
     await configure_commands(bot, config.owner_id, plugin_manager)
     me = await bot.get_me()
     logger.info("Aiogram-бот @%s запущен", me.username)
+    for pending in auto_tickets.list_pending():
+        pending_result = AutoTicketResult(
+            "pending",
+            tuple(pending["order_ids"]),
+            confirmation_id=str(pending["id"]),
+        )
+        await bot.send_message(
+            config.owner_id,
+            format_auto_ticket_result(pending_result),
+            reply_markup=auto_ticket_confirmation_menu(str(pending["id"])),
+        )
     try:
         await dispatcher.start_polling(
             bot, allowed_updates=dispatcher.resolve_used_update_types()
