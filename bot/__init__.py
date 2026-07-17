@@ -1,0 +1,1 @@
+"""FunPay profile Telegram bot."""

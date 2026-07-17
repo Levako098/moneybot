@@ -1,0 +1,10 @@
+{
+  "BOT_TOKEN": "PASTE_TELEGRAM_BOT_TOKEN",
+  "OWNERID": 123456789,
+  "SOURCE_GOLDEN_KEY": "PASTE_FUNPAY_GOLDEN_KEY",
+  "FUNPAY_SUPPORT_PHPSESSID": "",
+  "GEMINI_API_KEY": "",
+  "GEMINI_MODEL": "gemini-3-flash-preview",
+  "OPENROUTER_API_KEY": "",
+  "OPENROUTER_MODEL": "mistralai/mistral-7b-instruct:free"
+}

@@ -1,0 +1,28 @@
+# Local secrets
+config.json
+.env
+.env.*
+
+# Python environments and caches
+bot/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Runtime state
+bot/data/
+data/
+storage/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Local tooling metadata
+bot/.agents/
+bot/.git/
+.idea/
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
