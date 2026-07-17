@@ -165,7 +165,7 @@ def _on_order(cardinal: Any, event: Any) -> None:
     PROCESSING.add(order_id)
     try:
         order = cardinal.account.get_order(order_id)
-        if str(_lot_id(order)) != data["lot_id"]:
+        if str(_lot_id(order) or _lot_id(shortcut)) != data["lot_id"]:
             return
         amount = max(1, int(getattr(shortcut, "amount", None) or 1))
         with LOCK:
