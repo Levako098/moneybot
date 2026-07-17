@@ -8,6 +8,7 @@ import logging
 import re
 import sys
 import threading
+import uuid as uuid_module
 from types import MethodType
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -258,6 +259,49 @@ class PluginManager:
         }
         for record in self.plugins.values():
             record.enabled = record.uuid in self._enabled_saved and not record.duplicate
+
+    def install_plugin(self, file_name: str, content: bytes) -> PluginRecord:
+        if len(content) > 2 * 1024 * 1024:
+            raise ValueError("файл плагина больше 2 МБ")
+        safe_name = Path(file_name or "plugin.py").name
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", safe_name).strip(". ")
+        if not safe_name.lower().endswith(".py"):
+            raise ValueError("плагин должен быть Python-файлом с расширением .py")
+        if not safe_name:
+            raise ValueError("некорректное имя файла")
+
+        PLUGINS_DIR.mkdir(exist_ok=True)
+        target = PLUGINS_DIR / safe_name
+        if target.exists():
+            raise ValueError(f"файл {safe_name} уже существует")
+        temporary = PLUGINS_DIR / f".upload-{uuid_module.uuid4().hex}.tmp"
+        try:
+            temporary.write_bytes(content)
+            uploaded = self._metadata(temporary)
+            for path in PLUGINS_DIR.glob("*.py"):
+                try:
+                    existing = self._metadata(path)
+                except Exception:
+                    continue
+                if existing.uuid == uploaded.uuid:
+                    raise ValueError(
+                        f"плагин с UUID {uploaded.uuid} уже загружен: {path.name}"
+                    )
+                if existing.name.casefold() == uploaded.name.casefold():
+                    raise ValueError(
+                        f"плагин с названием {uploaded.name} уже загружен: {path.name}"
+                    )
+            temporary.replace(target)
+            record = self._metadata(target)
+            record.enabled = False
+            self.plugins[record.uuid] = record
+            self._enabled_saved.discard(record.uuid)
+            self._save_enabled()
+            logger.info("Плагин %s загружен через Telegram", target.name)
+            return record
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
     def initialize(self) -> None:
         self.account = Account(self.golden_key).get()

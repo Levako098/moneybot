@@ -94,6 +94,10 @@ class SystemSettings(StatesGroup):
     waiting_log_limit = State()
 
 
+class PluginUpload(StatesGroup):
+    waiting_file = State()
+
+
 class OwnerOnlyMiddleware(BaseMiddleware):
     def __init__(self, owner_id: int) -> None:
         self.owner_id = owner_id
@@ -331,6 +335,7 @@ def plugin_list_menu(manager: PluginManager) -> InlineKeyboardMarkup:
             text=f"{status} · {plugin.name} {plugin.version}",
             callback_data=f"plugin:view:{plugin.uuid}",
         )
+    builder.button(text="Добавить плагин", callback_data="plugins:add")
     builder.button(text="Обновить", callback_data="plugins:refresh")
     builder.button(text="Назад", callback_data="menu:main")
     builder.adjust(1)
@@ -1224,8 +1229,13 @@ async def callback_delivery_disable(
 
 
 @router.callback_query(F.data.in_({"menu:plugins", "plugins:refresh"}))
-async def callback_plugins(callback: CallbackQuery, plugin_manager: PluginManager) -> None:
+async def callback_plugins(
+    callback: CallbackQuery,
+    state: FSMContext,
+    plugin_manager: PluginManager,
+) -> None:
     await callback.answer()
+    await state.clear()
     if callback.message:
         enabled = sum(1 for item in plugin_manager.plugins.values() if item.enabled)
         await callback.message.edit_text(
@@ -1235,6 +1245,80 @@ async def callback_plugins(callback: CallbackQuery, plugin_manager: PluginManage
             "Новые плагины отключены до ручного включения.",
             reply_markup=plugin_list_menu(plugin_manager),
         )
+
+
+@router.callback_query(F.data == "plugins:add")
+async def callback_plugin_add(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(PluginUpload.waiting_file)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отмена", callback_data="plugins:add:cancel")
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Добавление плагина</b>\n\n"
+            "Отправьте плагин документом в формате <code>.py</code>. "
+            "Максимальный размер — 2 МБ. После проверки плагин будет добавлен выключенным.",
+            reply_markup=builder.as_markup(),
+        )
+
+
+@router.callback_query(F.data == "plugins:add:cancel")
+async def callback_plugin_add_cancel(
+    callback: CallbackQuery,
+    state: FSMContext,
+    plugin_manager: PluginManager,
+) -> None:
+    await callback.answer("Отменено")
+    await state.clear()
+    if callback.message:
+        enabled = sum(1 for item in plugin_manager.plugins.values() if item.enabled)
+        await callback.message.edit_text(
+            f"<b>Плагины Cardinal</b>\n\n"
+            f"Найдено: {len(plugin_manager.plugins)}\n"
+            f"Включено: {enabled}",
+            reply_markup=plugin_list_menu(plugin_manager),
+        )
+
+
+@router.message(PluginUpload.waiting_file, F.document)
+async def receive_plugin_file(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    plugin_manager: PluginManager,
+) -> None:
+    document = message.document
+    if document is None:
+        return
+    file_name = str(document.file_name or "plugin.py")
+    if not file_name.lower().endswith(".py"):
+        await message.answer("Нужен файл с расширением <code>.py</code>.")
+        return
+    if document.file_size and document.file_size > 2 * 1024 * 1024:
+        await message.answer("Файл слишком большой. Максимальный размер — 2 МБ.")
+        return
+    wait = await message.answer("Проверяю плагин...")
+    buffer = io.BytesIO()
+    try:
+        await bot.download(document.file_id, destination=buffer)
+        record = await asyncio.to_thread(
+            plugin_manager.install_plugin, file_name, buffer.getvalue()
+        )
+    except Exception as error:
+        reason = html.escape(str(error).splitlines()[0][:500])
+        await wait.edit_text(f"<b>Плагин не добавлен</b>\n{reason}")
+        return
+    await state.clear()
+    text, markup = plugin_detail(record)
+    await wait.edit_text(
+        "<b>Плагин добавлен и выключен.</b>\n\n" + text,
+        reply_markup=markup,
+    )
+
+
+@router.message(PluginUpload.waiting_file)
+async def receive_plugin_file_invalid(message: Message) -> None:
+    await message.answer("Отправьте Python-плагин документом с расширением <code>.py</code>.")
 
 
 @router.callback_query(F.data.startswith("plugin:view:"))
