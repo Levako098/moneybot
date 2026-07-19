@@ -814,6 +814,7 @@ def format_message_settings(automation: AutomationService) -> str:
         "username": "имя отправителя",
         "chat_name": "название чата",
         "message": "текст сообщения",
+        "command": "команда покупателя",
         "account": "ваш ник FunPay",
         "chat_id": "ID чата",
     }

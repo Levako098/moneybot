@@ -48,6 +48,28 @@ def _normalize(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
+def _raise_error_reason(error: Exception) -> str:
+    reason = str(getattr(error, "error_message", None) or "").strip()
+    response = getattr(error, "response", None)
+    if not reason and response is not None:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+        if isinstance(payload, dict):
+            reason = str(
+                payload.get("msg")
+                or payload.get("MSG")
+                or payload.get("error")
+                or ""
+            ).strip()
+    if not reason:
+        wait_time = getattr(error, "wait_time", None)
+        if wait_time:
+            reason = f"FunPay просит подождать {wait_time} сек."
+    return reason[:300] if reason else type(error).__name__
+
+
 class AutoDeliveryService:
     def __init__(self, account: Any, path: Path = AUTO_DELIVERY_PATH) -> None:
         self.account = account
@@ -156,15 +178,17 @@ class AutoDeliveryService:
                     raised += 1
                     raised_categories.append(str(row["name"]))
                 except Exception as error:
-                    reason = str(error).splitlines()[0].strip()
+                    reason = _raise_error_reason(error)
                     errors.append(
                         (
                             str(row["name"]),
-                            reason[:300] if reason else type(error).__name__,
+                            reason,
                         )
                     )
-                    logger.exception(
-                        "Не удалось поднять лоты категории %s", row["name"]
+                    logger.error(
+                        "Не удалось поднять лоты категории %s: %s",
+                        row["name"],
+                        reason,
                     )
 
             status = "raised" if not errors else "partial" if raised else "error"
