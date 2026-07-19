@@ -93,9 +93,19 @@ class AutoDeliveryService:
         lots = raw.get("lots") if isinstance(raw, dict) else {}
         delivered = raw.get("delivered_orders") if isinstance(raw, dict) else []
         data = {
-            "lots": lots if isinstance(lots, dict) else {},
-            "delivered_orders": delivered if isinstance(delivered, list) else [],
-        }
+        "lots": lots if isinstance(lots, dict) else {},
+        "delivered_orders": delivered if isinstance(delivered, list) else [],
+        "raise_retry_at": {
+            str(category_id): float(timestamp)
+            for category_id, timestamp in (
+                raw.get("raise_retry_at", {}).items()
+                if isinstance(raw, dict) and isinstance(raw.get("raise_retry_at", {}), dict)
+                else {}
+            )
+            if isinstance(category_id, (str, int))
+            and isinstance(timestamp, (int, float))
+        },
+    }
         self._save(data)
         return data
 
@@ -130,6 +140,16 @@ class AutoDeliveryService:
             self._lots_cache = list(lots)
             self._lots_cached_at = time.monotonic()
         return lots
+
+    def next_raise_delay(self) -> float | None:
+        """Return seconds until the next FunPay category retry, if scheduled."""
+        with self._lock:
+            retry_times = [
+                timestamp
+                for timestamp in self._data["raise_retry_at"].values()
+                if timestamp > time.time()
+            ]
+        return min(retry_times) - time.time() if retry_times else None
 
     def raise_all_lots(self) -> RaiseLotsResult:
         if not self._raise_lock.acquire(blocking=False):
@@ -170,15 +190,41 @@ class AutoDeliveryService:
             raised_categories = []
             errors = []
             for category_id, row in sorted(categories.items()):
+                with self._lock:
+                    retry_at = self._data["raise_retry_at"].get(str(category_id))
+                if retry_at and retry_at > time.time():
+                    remaining = max(1, int(retry_at - time.time()))
+                    errors.append(
+                        (
+                            str(row["name"]),
+                            f"Повторная попытка через {remaining} сек.",
+                        )
+                    )
+                    continue
                 try:
                     self.account.raise_lots(
                         category_id,
                         sorted(row["subcategories"]),
                     )
+                    with self._lock:
+                        self._data["raise_retry_at"].pop(str(category_id), None)
+                        self._save()
                     raised += 1
                     raised_categories.append(str(row["name"]))
+                    logger.info("Лоты категории %s успешно подняты", row["name"])
                 except Exception as error:
                     reason = _raise_error_reason(error)
+                    wait_time = getattr(error, "wait_time", None)
+                    if isinstance(wait_time, (int, float)) and wait_time > 0:
+                        retry_at = time.time() + float(wait_time) + 60
+                        with self._lock:
+                            self._data["raise_retry_at"][str(category_id)] = retry_at
+                            self._save()
+                        logger.info(
+                            "Следующая попытка поднять категорию %s через %.0f сек.",
+                            row["name"],
+                            float(wait_time) + 60,
+                        )
                     errors.append(
                         (
                             str(row["name"]),

@@ -3177,18 +3177,30 @@ async def run_bot(config: BotConfig) -> None:
         future.add_done_callback(log_auto_ticket_result)
 
     async def auto_raise_worker() -> None:
+        first_run = True
         while True:
-            await asyncio.sleep(3600)
+            if first_run:
+                first_run = False
+            else:
+                retry_delay = auto_delivery.next_raise_delay()
+                await asyncio.sleep(
+                    3600
+                    if retry_delay is None
+                    else max(1, retry_delay)
+                )
             if not auto_raise_enabled():
                 continue
             try:
+                logger.info("Автоподнятие: выполняется попытка после запуска/ожидания")
                 result = await asyncio.to_thread(auto_delivery.raise_all_lots)
                 if result.categories_raised > 0:
                     await bot.send_message(
                         config.owner_id,
                         "✅ <b>Лоты подняты автоматически</b>\n\n"
                         f"Категорий поднято: {result.categories_raised} из {result.categories_total}\n"
-                        f"Активных лотов: {result.total_lots}"
+                        "Успешно подняты: "
+                        + ", ".join(html.escape(category) for category in result.raised_categories)
+                        + f"\nАктивных лотов: {result.total_lots}"
                         + ("\n\n<b>Поднятые категории:</b>\n" + "\n".join(
                             f"• {html.escape(category)}" for category in result.raised_categories
                         ) if result.raised_categories else "")
