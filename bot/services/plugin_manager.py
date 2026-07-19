@@ -301,6 +301,7 @@ class PluginManager:
         self._runner_started = False
         self._runner_allowed = False
         self._shutdown_done = False
+        self.connection_observer: Callable[[bool, Exception | None], None] | None = None
         self._enabled_saved = self._load_enabled()
         self._pinned_saved = self._load_pinned()
         self.MAIN_CFG = self._build_main_config(token, owner_id, golden_key)
@@ -1389,6 +1390,11 @@ class PluginManager:
         self._runner_allowed = True
         self.start_runner()
 
+    def set_connection_observer(
+        self, observer: Callable[[bool, Exception | None], None]
+    ) -> None:
+        self.connection_observer = observer
+
     def _runner_loop(self) -> None:
         assert self.runner is not None
         event_handlers = {
@@ -1401,9 +1407,14 @@ class PluginManager:
             funpay_events.EventTypes.NEW_ORDER: self.new_order_handlers,
             funpay_events.EventTypes.ORDER_STATUS_CHANGED: self.order_status_changed_handlers,
         }
+        connected = True
         while True:
             try:
                 for event in self.runner.listen(requests_delay=4):
+                    if not connected:
+                        connected = True
+                        if self.connection_observer:
+                            self.connection_observer(True, None)
                     name = type(event).__name__
                     if name == "NewMessageEvent":
                         for observer in list(self.funpay_message_observers):
@@ -1419,7 +1430,11 @@ class PluginManager:
                                 logger.exception("Ошибка observer заказа FunPay")
                     handlers = event_handlers.get(getattr(event, "type", None), [])
                     self.run_handlers(handlers, (self, event))
-            except Exception:
+            except Exception as error:
+                if connected:
+                    connected = False
+                    if self.connection_observer:
+                        self.connection_observer(False, error)
                 logger.exception("Ошибка FunPay Runner, повтор через 10 секунд")
                 threading.Event().wait(10)
 

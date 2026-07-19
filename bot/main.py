@@ -37,7 +37,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import BotConfig, ConfigError, load_config
 from bot.compat.tg_bot import CBT as CARDINAL_CBT
-from bot.funpay_service import FunPayService, FunPayServiceError, ProfileInfo
+from bot.funpay_service import (
+    FunPayService,
+    FunPayServiceError,
+    ProfileInfo,
+    read_balance,
+)
 from bot.version import __version__
 from bot.services.auto_delivery import (
     DELIVERY_VARIABLES,
@@ -3197,6 +3202,31 @@ async def run_bot(config: BotConfig) -> None:
     plugin_manager.add_funpay_message_observer(automation.handle_event)
     plugin_manager.add_funpay_message_observer(notify_funpay_message)
     plugin_manager.add_funpay_order_observer(handle_auto_delivery)
+
+    def notify_funpay_connection(connected: bool, error: Exception | None) -> None:
+        if connected:
+            text = "✅ <b>Соединение с FunPay восстановлено</b>"
+        else:
+            error_text = html.escape(str(error).splitlines()[0][:300]) if error else "неизвестная ошибка"
+            text = (
+                "⚠️ <b>Соединение с FunPay потеряно</b>\n"
+                f"Причина: {error_text}\n"
+                "Повторная попытка через 10 секунд."
+            )
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(config.owner_id, text),
+            event_loop,
+        )
+
+        def log_connection_notification(result: Any) -> None:
+            try:
+                result.result()
+            except Exception:
+                logger.exception("Не удалось отправить уведомление о соединении с FunPay")
+
+        future.add_done_callback(log_connection_notification)
+
+    plugin_manager.set_connection_observer(notify_funpay_connection)
     plugin_manager.activate_runner()
     system_settings.start_resource_monitor(notify_resource_warning)
     auto_tickets.set_result_callback(notify_auto_ticket)
@@ -3205,6 +3235,38 @@ async def run_bot(config: BotConfig) -> None:
     await configure_commands(bot, config.owner_id, plugin_manager)
     me = await bot.get_me()
     logger.info("Aiogram-бот @%s запущен", me.username)
+    funpay_profile = plugin_manager.profile
+    balance_text = "не удалось получить"
+    if plugin_manager.account and funpay_profile:
+        try:
+            balance = read_balance(plugin_manager.account, funpay_profile)
+            balance_text = (
+                f"{money(balance.available_rub, 'RUB')} доступно"
+            )
+        except Exception as error:
+            balance_text = html.escape(str(error).splitlines()[0][:200])
+    initialized_plugins = [
+        record.name
+        for record in plugin_manager.plugins.values()
+        if record.loaded
+    ]
+    plugins_text = (
+        "\n\n<b>Инициализированные плагины:</b>\n"
+        + "\n".join(f"• {html.escape(name)}" for name in initialized_plugins)
+        if initialized_plugins
+        else "\n\n<b>Инициализированные плагины:</b> нет"
+    )
+    try:
+        await bot.send_message(
+            config.owner_id,
+            "✅ <b>Бот запущен</b>\n\n"
+            f"FunPay: @{html.escape(getattr(funpay_profile, 'username', 'неизвестно'))}\n"
+            f"Баланс: {balance_text}\n"
+            f"Версия: <code>{html.escape(__version__)}</code>"
+            + plugins_text,
+        )
+    except Exception:
+        logger.exception("Не удалось отправить уведомление о запуске бота в Telegram")
     update_service.start(notify_update_release)
     auto_raise_task = asyncio.create_task(auto_raise_worker())
     for pending in auto_tickets.list_pending():
