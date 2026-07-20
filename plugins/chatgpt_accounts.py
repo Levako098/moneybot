@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telebot.handler_backends import ContinueHandling
 
 
 NAME = "ChatGPT Accounts Auto Delivery"
@@ -390,10 +391,10 @@ def _on_command(cardinal: Any, message: Any) -> None:
 
 def _on_message(cardinal: Any, message: Any) -> None:
     if not getattr(message, "from_user", None):
-        return
+        return ContinueHandling()
     state = cardinal.telegram.get_state(message.chat.id, message.from_user.id)
     if not state:
-        return
+        return ContinueHandling()
     mode = state.get("state")
     if mode == "cg_lot":
         value = str(getattr(message, "text", "") or "").strip()
@@ -464,6 +465,8 @@ def _on_message(cardinal: Any, message: Any) -> None:
             _save(data)
         cardinal.telegram.clear_state(message.chat.id, message.from_user.id)
         _show_settings(cardinal, message.chat.id)
+    else:
+        return ContinueHandling()
 
 
 def _on_callback(cardinal: Any, call: Any) -> None:
